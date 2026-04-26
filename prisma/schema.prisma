@@ -948,6 +948,51 @@ model BlogCategory {
 }
 
 // ============================================
+// CONTACT & SUBSCRIBERS
+// ============================================
+
+enum ContactStatus {
+  UNREAD
+  READ
+  REPLIED
+  ARCHIVED
+}
+
+model ContactMessage {
+  id              String        @id @default(auto()) @map("_id") @db.ObjectId
+  name            String
+  email           String
+  phone           String?
+  subject         String
+  message         String
+  heardAboutUs    String?       // "How did you hear about us?"
+  preferredContact String?      // "How can we reach you?" e.g. "email", "phone", "whatsapp"
+  preferredTime   String?       // "Best time to reach you?" e.g. "morning", "afternoon", "evening"
+  status          ContactStatus @default(UNREAD)
+  repliedAt       DateTime?
+  notes           String?       // internal admin notes
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@map("contact_messages")
+}
+
+model Subscriber {
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  email       String    @unique
+  name        String?
+  isActive    Boolean   @default(true)
+  source      String?   // e.g. "footer", "checkout", "popup"
+  tags        String[]  @default([])
+  subscribedAt DateTime @default(now())
+  unsubscribedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@map("subscribers")
+}
+
+// ============================================
 // ANALYTICS & LOGS
 // ============================================
 

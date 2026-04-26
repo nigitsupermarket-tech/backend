@@ -11,12 +11,8 @@
     "types": ["node"]
   },
   "include": [
-    "seed.ts",
-    "cleanup-old-shipping.ts",
-    "seed-shipping-system.ts",
-    "seed-blog.ts",
-    "resetSalesCount.ts",
     "seed-NigitTriple-products.ts",
+    "seed-blog-nigitriple.ts"
     "seed-NigitTriple-settings.ts"
   ],
   "exclude": ["node_modules", "../dist"]
