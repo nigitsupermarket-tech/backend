@@ -1,0 +1,20 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "rootDir": ".",
+    "outDir": "../dist/prisma",
+    "ignoreDeprecations": "6.0",
+    "types": ["node"]
+  },
+  "include": [
+    "seed.ts",
+    "cleanup-old-shipping.ts",
+    "seed-shipping-system.ts",
+    "seed-blog.ts",
+    "resetSalesCount.ts",
+    "seed-nigitriple-products.ts",
+    "seed-nigitriple-settings.ts"
+  ],
+  "exclude": ["node_modules", "../dist"]
+}
