@@ -538,7 +538,9 @@ export const getProducts = async (
       limit = "12",
       search,
       categoryId,
+      categorySlug,
       brandId,
+      brandSlug,
       minPrice,
       maxPrice,
       inStock,
@@ -564,15 +566,17 @@ export const getProducts = async (
       ];
     }
 
-    // ── Category: accepts ObjectId OR slug ────────────────────────────────────
-    if (categoryId) {
-      const resolvedCatId = await resolveCategoryId(categoryId as string);
+    // ── Category: accepts categorySlug OR categoryId (ObjectId or slug) ───────
+    const rawCategoryValue = (categorySlug || categoryId) as string | undefined;
+    if (rawCategoryValue) {
+      const resolvedCatId = await resolveCategoryId(rawCategoryValue);
       if (resolvedCatId) where.categoryId = resolvedCatId;
     }
 
-    // ── Brand: accepts comma-separated ObjectIds OR slugs ─────────────────────
-    if (brandId) {
-      const rawBrandIds = (brandId as string).split(",").filter(Boolean);
+    // ── Brand: accepts brandSlug OR brandId (comma-separated slugs or IDs) ────
+    const rawBrandValue = (brandSlug || brandId) as string | undefined;
+    if (rawBrandValue) {
+      const rawBrandIds = rawBrandValue.split(",").filter(Boolean);
       const resolvedBrandIds = (
         await Promise.all(rawBrandIds.map(resolveBrandId))
       ).filter(Boolean) as string[];
