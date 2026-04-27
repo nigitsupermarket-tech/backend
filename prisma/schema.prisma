@@ -128,6 +128,11 @@ model SiteSetting {
   heroSlides        Json[]   @default([])
   heroBanners       Json[]   @default([])
 
+  // Card Hero (Bell-Italia style — 3-column cards per slide)
+  cardHeroSlides    Json[]   @default([])
+  // "classic" = original slider+banners | "card" = Bell-Italia cards | "both" = show both
+  heroDisplayType   String   @default("classic")
+
   // Trust Badges
   trustBadges       Json[]   @default([])
 

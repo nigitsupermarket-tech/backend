@@ -12,8 +12,9 @@
   },
   "include": [
     "seed-NigitTriple-products.ts",
-    "seed-blog-nigitriple.ts"
-    "seed-NigitTriple-settings.ts"
+    "seed-blog-nigitriple.ts",
+    "seed-NigitTriple-settings.ts",
+    "seed-card-hero.ts",
   ],
   "exclude": ["node_modules", "../dist"]
 }
