@@ -326,3 +326,153 @@ export async function sendOrderDeliveredEmail(
     text: `Hi ${name}, your order ${orderNumber} has been delivered! Thank you for shopping with us.`,
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// APPEND these two functions to the bottom of src/services/email.service.ts
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Bank transfer instructions — sent right after a BANK_TRANSFER order is placed.
+ * Shows the customer account details + their order number as the payment reference.
+ */
+export async function sendBankTransferInstructionsEmail(
+  email: string,
+  name: string,
+  orderNumber: string,
+  orderTotal: number,
+  bank: {
+    bankName: string;
+    accountName: string;
+    accountNumber: string;
+    sortCode?: string;
+  },
+): Promise<void> {
+  const orderUrl = `${process.env.CLIENT_URL}/account/orders`;
+
+  const html = `
+    <!DOCTYPE html><html><head><meta charset="utf-8"><style>${baseStyles}
+      .bank-box { background:#f0fdf4; border:2px solid #86efac; border-radius:8px; padding:24px; margin:20px 0; }
+      .bank-row { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #dcfce7; font-size:15px; }
+      .bank-row:last-child { border-bottom:none; }
+      .bank-label { color:#6b7280; font-size:13px; }
+      .bank-value { font-weight:700; color:#111827; font-size:15px; letter-spacing:0.5px; }
+      .ref-box { background:#fefce8; border:1px solid #fde68a; border-radius:6px; padding:14px 18px; margin:16px 0; text-align:center; }
+      .ref-label { font-size:12px; color:#92400e; margin:0 0 4px; }
+      .ref-value { font-size:20px; font-weight:800; color:#92400e; letter-spacing:1px; }
+      .steps { padding-left:20px; color:#4b5563; }
+      .steps li { margin-bottom:8px; }
+      .warning { background:#fff7ed; border-left:4px solid #f97316; padding:12px 16px; border-radius:0 6px 6px 0; margin:16px 0; font-size:13px; color:#9a3412; }
+    </style></head>
+    <body><div class="wrapper"><div class="container">
+      <div class="header"><h1>Nigit<span>Triple</span> Industry</h1></div>
+      <div class="content">
+        <h2>Complete Your Payment 🏦</h2>
+        <p>Hi ${name},</p>
+        <p>Thank you for your order! To complete it, please transfer <strong>₦${orderTotal.toLocaleString("en-NG", { minimumFractionDigits: 2 })}</strong> to the account below:</p>
+
+        <div class="bank-box">
+          <div class="bank-row">
+            <span class="bank-label">Bank</span>
+            <span class="bank-value">${bank.bankName}</span>
+          </div>
+          <div class="bank-row">
+            <span class="bank-label">Account Name</span>
+            <span class="bank-value">${bank.accountName}</span>
+          </div>
+          <div class="bank-row">
+            <span class="bank-label">Account Number</span>
+            <span class="bank-value">${bank.accountNumber}</span>
+          </div>
+          ${
+            bank.sortCode
+              ? `
+          <div class="bank-row">
+            <span class="bank-label">Sort Code</span>
+            <span class="bank-value">${bank.sortCode}</span>
+          </div>`
+              : ""
+          }
+          <div class="bank-row">
+            <span class="bank-label">Amount</span>
+            <span class="bank-value" style="color:#16a34a;">₦${orderTotal.toLocaleString("en-NG", { minimumFractionDigits: 2 })}</span>
+          </div>
+        </div>
+
+        <div class="ref-box">
+          <p class="ref-label">USE THIS AS YOUR TRANSFER NARRATION / REFERENCE</p>
+          <p class="ref-value">${orderNumber}</p>
+        </div>
+
+        <p><strong>After transferring, please upload your proof of payment:</strong></p>
+        <ol class="steps">
+          <li>Go to <strong>My Orders</strong> on our website</li>
+          <li>Open order <strong>${orderNumber}</strong></li>
+          <li>Click <strong>"Upload Proof of Payment"</strong> and attach your receipt or screenshot</li>
+          <li>Our team will verify and confirm your order within <strong>2–4 business hours</strong></li>
+        </ol>
+
+        <div class="warning">
+          ⚠️ Always use your order number <strong>${orderNumber}</strong> as the transfer narration so we can match your payment quickly.
+        </div>
+
+        <p style="text-align:center;margin:28px 0;">
+          <a href="${orderUrl}" class="button">Go to My Orders</a>
+        </p>
+
+        <p class="note">If you have any issues, contact us at <a href="mailto:${process.env.EMAIL_FROM}" style="color:#16a34a;">${process.env.EMAIL_FROM}</a></p>
+      </div>
+      <div class="footer"><p>© ${new Date().getFullYear()} Nigittriple Industry. All rights reserved.</p></div>
+    </div></div></body></html>
+  `;
+
+  await sendEmail({
+    to: email,
+    subject: `Payment Instructions – Order ${orderNumber} – NigiTriple`,
+    html,
+    text: `Hi ${name}, please transfer ₦${orderTotal.toLocaleString()} to ${bank.bankName}, Account: ${bank.accountNumber} (${bank.accountName}). Use ${orderNumber} as your reference. Then upload proof of payment on the website.`,
+  });
+}
+
+/**
+ * Bank transfer confirmed — sent by staff after manually verifying the transfer.
+ * Triggers when admin hits "Confirm Payment" on the order detail page.
+ */
+export async function sendBankTransferConfirmedEmail(
+  email: string,
+  name: string,
+  orderNumber: string,
+  orderTotal: number,
+): Promise<void> {
+  const orderUrl = `${process.env.CLIENT_URL}/account/orders`;
+
+  const html = `
+    <!DOCTYPE html><html><head><meta charset="utf-8"><style>${baseStyles}
+      .confirm-box { background:#f0fdf4; border:1px solid #86efac; border-radius:8px; padding:20px; margin:20px 0; }
+    </style></head>
+    <body><div class="wrapper"><div class="container">
+      <div class="header"><h1>Payment Confirmed ✓</h1></div>
+      <div class="content">
+        <p>Hi ${name},</p>
+        <p>Great news! We have received and verified your bank transfer for order <strong>${orderNumber}</strong>.</p>
+        <div class="confirm-box">
+          <p style="margin:0;"><strong>Order Number:</strong> ${orderNumber}</p>
+          <p style="margin:8px 0 0;"><strong>Amount Received:</strong> ₦${orderTotal.toLocaleString("en-NG", { minimumFractionDigits: 2 })}</p>
+          <p style="margin:8px 0 0;"><strong>Status:</strong> <span style="color:#16a34a;font-weight:700;">CONFIRMED ✓</span></p>
+        </div>
+        <p>We're now preparing your order for delivery. You'll receive another update once it ships.</p>
+        <p style="text-align:center;margin:28px 0;">
+          <a href="${orderUrl}" class="button">Track Your Order</a>
+        </p>
+        <p class="note">Questions? Reply to this email or contact us at <a href="mailto:${process.env.EMAIL_FROM}" style="color:#16a34a;">${process.env.EMAIL_FROM}</a></p>
+      </div>
+      <div class="footer"><p>© ${new Date().getFullYear()} Nigittriple Industry. All rights reserved.</p></div>
+    </div></div></body></html>
+  `;
+
+  await sendEmail({
+    to: email,
+    subject: `Payment Confirmed – Order ${orderNumber} – NigiTriple`,
+    html,
+    text: `Hi ${name}, your bank transfer for order ${orderNumber} (₦${orderTotal.toLocaleString()}) has been confirmed. Your order is now being processed.`,
+  });
+}

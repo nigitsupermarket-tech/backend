@@ -1,18 +1,30 @@
-import { Router, raw } from 'express';
-import { initializePayment, verifyPayment, paystackWebhook } from '../controllers/payment.controller';
-import { protect } from '../middlewares/auth.middleware';
+import { Router, raw } from "express";
+import {
+  initializePayment,
+  verifyPayment,
+  paystackWebhook,
+  getBankDetails,
+  notifyBankTransfer,
+  submitProofOfPayment,
+  confirmBankTransfer,
+} from "../controllers/payment.controller";
+import { protect, restrictTo } from "../middlewares/auth.middleware";
 
 const router = Router();
 
-// Paystack webhook — raw body needed for signature verification
-router.post(
-  '/webhook',
-  raw({ type: 'application/json' }),
-  paystackWebhook
-);
+// ── Paystack webhook — raw body required for signature verification ───────────
+router.post("/webhook", raw({ type: "application/json" }), paystackWebhook);
 
-// Protected
-router.post('/initialize', protect, initializePayment);
-router.get('/verify/:reference', verifyPayment);
+// ── Public ────────────────────────────────────────────────────────────────────
+router.get("/bank-details", getBankDetails);
+router.get("/verify/:reference", verifyPayment);
+
+// ── Customer (authenticated) ──────────────────────────────────────────────────
+router.post("/initialize", protect, initializePayment);
+router.post("/bank-transfer/notify", protect, notifyBankTransfer);
+router.post("/bank-transfer/proof", protect, submitProofOfPayment);
+
+// ── Staff / Admin only ────────────────────────────────────────────────────────
+router.post("/bank-transfer/confirm", protect, confirmBankTransfer);
 
 export default router;

@@ -457,6 +457,7 @@ enum OrderStatus {
 enum PaymentStatus {
   PENDING
   PAID
+  AWAITING_PROOF 
   FAILED
   REFUNDED
 }
@@ -490,6 +491,8 @@ model Order {
   paymentMethod     PaymentMethod
   paymentReference  String?
   paidAt            DateTime?
+  proofOfPaymentUrl     String?   
+  proofSubmittedAt      DateTime?
 
   // Shipping
   shippingAddress   Json

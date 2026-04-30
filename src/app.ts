@@ -41,8 +41,10 @@ dotenv.config();
 
 const app: Application = express();
 
+const API_PREFIX = "/api/v1";
+
 // ============================================
-// MIDDLEWARE
+// CORS (must come before everything)
 // ============================================
 
 const allowedOrigins = [
@@ -65,6 +67,12 @@ const corsOptions = {
   optionsSuccessStatus: 200,
 };
 app.use(cors(corsOptions));
+
+app.use(`${API_PREFIX}/payment`, paymentRoutes);
+
+// ============================================
+// GLOBAL MIDDLEWARE (after webhook route)
+// ============================================
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(cookieParser());
@@ -76,7 +84,7 @@ if (process.env.NODE_ENV === "development") {
 }
 
 // ============================================
-// API ROUTES
+// HEALTH CHECKS
 // ============================================
 
 app.get("/health", (req: Request, res: Response) => {
@@ -108,7 +116,9 @@ app.get("/", async (req: Request, res: Response) => {
   }
 });
 
-const API_PREFIX = "/api/v1";
+// ============================================
+// API ROUTES
+// ============================================
 
 app.use(`${API_PREFIX}/auth`, authRoutes);
 app.use(`${API_PREFIX}/users`, userRoutes);
@@ -122,7 +132,7 @@ app.use(`${API_PREFIX}/discounts`, discountRoutes);
 app.use(`${API_PREFIX}/shipping`, shippingRoutes);
 app.use(`${API_PREFIX}/blog`, blogRoutes);
 app.use(`${API_PREFIX}/upload`, uploadRoutes);
-app.use(`${API_PREFIX}/payment`, paymentRoutes);
+// NOTE: /payment is already registered above (before express.json)
 app.use(`${API_PREFIX}/settings`, settingsRoutes);
 app.use(`${API_PREFIX}/analytics`, analyticsRoutes);
 app.use(`${API_PREFIX}/activities`, activityRoutes);
