@@ -205,10 +205,17 @@ export const cancelOrder = async (
     ]);
 
     for (const item of order.items) {
-      await prisma.product.update({
-        where: { id: item.productId },
-        data: { stockQuantity: { increment: item.quantity } },
-      });
+      // Only restore stock if payment was confirmed — stock is only deducted
+      // at payment confirmation, not at order creation.
+      if (order.paymentStatus === "PAID") {
+        await prisma.product.update({
+          where: { id: item.productId },
+          data: {
+            stockQuantity: { increment: item.quantity },
+            salesCount: { decrement: item.quantity },
+          },
+        });
+      }
     }
 
     res
@@ -402,111 +409,87 @@ export const createOrder = async (
     const maxDays = shippingMethod.estimatedMaxDays || 5;
     estimatedDelivery.setDate(estimatedDelivery.getDate() + maxDays);
 
-    const order = await prisma.$transaction(async (tx) => {
-      const newOrder = await tx.order.create({
-        data: {
-          orderNumber: generateOrderNumber(),
-          userId,
-          status: "PENDING",
-          subtotal,
-          discountAmount,
-          tax,
-          shippingCost,
-          total,
-          paymentMethod,
-          paymentStatus: "PENDING",
-          shippingAddress,
-          billingAddress: billingAddress || shippingAddress,
-          shippingMethodId: shippingMethod.id,
-          shippingMethodName: shippingMethod.name,
-          estimatedDelivery,
-          customerName: user.name,
-          customerEmail: user.email,
-          customerPhone: user.phone || shippingAddress.phone,
-          discountCode: discountCode || null,
-          discountId,
-          customerNotes,
-          items: { create: orderItems },
-        },
-        include: { items: true },
-      });
+    const order = await prisma.$transaction(
+      async (tx) => {
+        // ── CORE TRANSACTION: only writes that must roll back together ─────────
+        // Every await is a network round-trip to MongoDB Atlas. Keep this lean.
+        // Stock deduction is NOT here — it happens at payment confirmation only.
 
-      // Update inventory
-      for (const item of orderItems) {
-        await tx.product.update({
-          where: { id: item.productId },
+        const newOrder = await tx.order.create({
           data: {
-            stockQuantity: { decrement: item.quantity },
-            salesCount: { increment: item.quantity },
+            orderNumber: generateOrderNumber(),
+            userId,
+            status: "PENDING",
+            subtotal,
+            discountAmount,
+            tax,
+            shippingCost,
+            total,
+            paymentMethod,
+            paymentStatus: "PENDING",
+            shippingAddress,
+            billingAddress: billingAddress || shippingAddress,
+            shippingMethodId: shippingMethod.id,
+            shippingMethodName: shippingMethod.name,
+            estimatedDelivery,
+            customerName: user.name,
+            customerEmail: user.email,
+            customerPhone: user.phone || shippingAddress.phone,
+            discountCode: discountCode || null,
+            discountId,
+            customerNotes,
+            items: { create: orderItems },
           },
+          include: { items: true },
         });
-        await tx.inventoryLog.create({
-          data: {
-            productId: item.productId,
-            type: "SALE",
-            quantity: item.quantity,
-            previousQty: 0,
-            newQty: 0,
-            reason: `Order ${newOrder.orderNumber}`,
-            reference: newOrder.id,
-          },
-        });
-      }
 
-      if (discountId) {
-        await tx.discount.update({
-          where: { id: discountId },
-          data: { usageCount: { increment: 1 } },
-        });
-      }
+        // Discount usage must be atomic with order creation
+        if (discountId) {
+          await tx.discount.update({
+            where: { id: discountId },
+            data: { usageCount: { increment: 1 } },
+          });
+        }
 
-      // Clear cart
-      const cart = await tx.cart.findFirst({ where: { userId } });
-      if (cart) await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
+        // Clear cart — customer expects empty cart immediately
+        const cart = await tx.cart.findFirst({ where: { userId } });
+        if (cart) await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
 
-      // Create order status history
-      await tx.orderStatusHistory.create({
+        return newOrder;
+      },
+      { timeout: 30000 }, // 30s — MongoDB Atlas + Nigeria latency needs more than 5s default
+    );
+
+    // ── POST-TRANSACTION: best-effort writes (run in parallel, don't block response) ──
+    await Promise.allSettled([
+      prisma.orderStatusHistory.create({
+        data: { orderId: order.id, status: "PENDING", notes: "Order placed" },
+      }),
+      prisma.orderTrackingUpdate.create({
         data: {
-          orderId: newOrder.id,
-          status: "PENDING",
-          notes: "Order placed",
-        },
-      });
-
-      // Create initial tracking update
-      await tx.orderTrackingUpdate.create({
-        data: {
-          orderId: newOrder.id,
+          orderId: order.id,
           status: "Order Confirmed",
           message: "Your order has been received and is being processed",
           timestamp: new Date(),
         },
-      });
-
-      // Update user stats
-      await tx.user.update({
+      }),
+      prisma.user.update({
         where: { id: userId },
         data: {
           totalSpent: { increment: total },
           orderCount: { increment: 1 },
           lastOrderDate: new Date(),
         },
-      });
+      }),
+    ]);
 
-      return newOrder;
-    });
-
-    // Send confirmation email
-    try {
-      await sendOrderConfirmationEmail(
-        user.email,
-        user.name,
-        order.orderNumber,
-        total,
-      );
-    } catch (err) {
-      console.error("Failed to send order confirmation email:", err);
-    }
+    // Fire-and-forget — SMTP timeouts must never block the HTTP response
+    sendOrderConfirmationEmail(
+      user.email,
+      user.name,
+      order.orderNumber,
+      total,
+    ).catch((err) => console.error("[email] Order confirmation failed:", err));
 
     res.status(201).json({
       success: true,
@@ -577,18 +560,16 @@ export const addTrackingUpdate = async (
       },
     });
 
-    // Send tracking update email
-    try {
-      await sendTrackingUpdateEmail(
-        order.user.email,
-        order.user.name,
-        order.orderNumber,
-        status,
-        message,
-      );
-    } catch (err) {
-      console.error("Failed to send tracking email:", err);
-    }
+    // Fire-and-forget — SMTP timeouts must never block the response
+    sendTrackingUpdateEmail(
+      order.user.email,
+      order.user.name,
+      order.orderNumber,
+      status,
+      message,
+    ).catch((err) =>
+      console.error("[email] Tracking update email failed:", err),
+    );
 
     res.status(201).json({
       success: true,

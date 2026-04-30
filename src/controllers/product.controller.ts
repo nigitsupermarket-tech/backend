@@ -2,7 +2,10 @@ import { Request, Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
-import { deleteCloudinaryImages, deleteCloudinaryImage } from "../lib/cloudinary";
+import {
+  deleteCloudinaryImages,
+  deleteCloudinaryImage,
+} from "../lib/cloudinary";
 
 // GET /api/v1/products/shippable
 // Returns only products that have: at least 1 image, weight set, and price > 0
@@ -332,7 +335,9 @@ export const updateProduct = async (
     // If a new images array is supplied, delete any URLs that were removed
     if (Array.isArray(rest.images) && product.images.length > 0) {
       const newImageSet = new Set(rest.images as string[]);
-      const removedImages = product.images.filter((img) => !newImageSet.has(img));
+      const removedImages = product.images.filter(
+        (img) => !newImageSet.has(img),
+      );
       if (removedImages.length > 0) {
         await deleteCloudinaryImages(removedImages);
       }
@@ -609,17 +614,47 @@ export const getProducts = async (
         (prisma as any).$runCommandRaw({
           aggregate: "products",
           pipeline: [
-            { $match: { status: "ACTIVE", ...(Object.keys(where).length > 1 ? { $expr: { $and: [] } } : {}) } },
+            {
+              $match: {
+                status: "ACTIVE",
+                ...(Object.keys(where).length > 1
+                  ? { $expr: { $and: [] } }
+                  : {}),
+              },
+            },
             { $sample: { size: sampleSize } },
             {
               $project: {
-                _id: 1, name: 1, slug: 1, description: 1, shortDescription: 1,
-                sku: 1, barcode: 1, price: 1, comparePrice: 1, costPrice: 1,
-                trackInventory: 1, stockQuantity: 1, lowStockThreshold: 1, allowBackorder: 1,
-                images: 1, videos: 1, categoryId: 1, brandId: 1, tags: 1,
-                netWeight: 1, packageSize: 1, unitsPerCarton: 1, isOnPromotion: 1,
-                status: 1, isFeatured: 1, isNewArrival: 1, viewCount: 1, salesCount: 1,
-                createdAt: 1, updatedAt: 1,
+                _id: 1,
+                name: 1,
+                slug: 1,
+                description: 1,
+                shortDescription: 1,
+                sku: 1,
+                barcode: 1,
+                price: 1,
+                comparePrice: 1,
+                costPrice: 1,
+                trackInventory: 1,
+                stockQuantity: 1,
+                lowStockThreshold: 1,
+                allowBackorder: 1,
+                images: 1,
+                videos: 1,
+                categoryId: 1,
+                brandId: 1,
+                tags: 1,
+                netWeight: 1,
+                packageSize: 1,
+                unitsPerCarton: 1,
+                isOnPromotion: 1,
+                status: 1,
+                isFeatured: 1,
+                isNewArrival: 1,
+                viewCount: 1,
+                salesCount: 1,
+                createdAt: 1,
+                updatedAt: 1,
               },
             },
           ],
@@ -631,12 +666,23 @@ export const getProducts = async (
       total = totalCount;
       const rawProducts = (raw as any)?.cursor?.firstBatch ?? [];
 
-      console.log(`[getProducts/random] raw sample count: ${rawProducts.length}`);
+      console.log(
+        `[getProducts/random] raw sample count: ${rawProducts.length}`,
+      );
       if (rawProducts.length > 0) {
         const sample = rawProducts[0];
-        console.log(`[getProducts/random] sample _id type: ${typeof sample._id}, value:`, sample._id);
-        console.log(`[getProducts/random] sample categoryId type: ${typeof sample.categoryId}, value:`, sample.categoryId);
-        console.log(`[getProducts/random] sample brandId type: ${typeof sample.brandId}, value:`, sample.brandId);
+        console.log(
+          `[getProducts/random] sample _id type: ${typeof sample._id}, value:`,
+          sample._id,
+        );
+        console.log(
+          `[getProducts/random] sample categoryId type: ${typeof sample.categoryId}, value:`,
+          sample.categoryId,
+        );
+        console.log(
+          `[getProducts/random] sample brandId type: ${typeof sample.brandId}, value:`,
+          sample.brandId,
+        );
       }
 
       // MongoDB $runCommandRaw returns ObjectId fields as { $oid: "hexstring" } objects,
@@ -644,57 +690,72 @@ export const getProducts = async (
       // We must extract the $oid property explicitly.
       const extractOid = (v: any): string | null => {
         if (!v) return null;
-        if (typeof v === "string") return v;            // already a string
-        if (typeof v.$oid === "string") return v.$oid;  // { $oid: "..." } shape
+        if (typeof v === "string") return v; // already a string
+        if (typeof v.$oid === "string") return v.$oid; // { $oid: "..." } shape
         return null;
       };
 
       // Resolve category + brand IDs correctly
-      const catIds = [...new Set(
-        rawProducts.map((p: any) => extractOid(p.categoryId)).filter(Boolean)
-      )] as string[];
-      const brandIds = [...new Set(
-        rawProducts.map((p: any) => extractOid(p.brandId)).filter(Boolean)
-      )] as string[];
+      const catIds = [
+        ...new Set(
+          rawProducts.map((p: any) => extractOid(p.categoryId)).filter(Boolean),
+        ),
+      ] as string[];
+      const brandIds = [
+        ...new Set(
+          rawProducts.map((p: any) => extractOid(p.brandId)).filter(Boolean),
+        ),
+      ] as string[];
 
       console.log(`[getProducts/random] catIds:`, catIds);
       console.log(`[getProducts/random] brandIds:`, brandIds);
 
       const [cats, brands] = await Promise.all([
-        catIds.length ? prisma.category.findMany({ where: { id: { in: catIds } }, select: { id: true, name: true, slug: true } }) : [],
-        brandIds.length ? prisma.brand.findMany({ where: { id: { in: brandIds } }, select: { id: true, name: true, slug: true, logo: true } }) : [],
+        catIds.length
+          ? prisma.category.findMany({
+              where: { id: { in: catIds } },
+              select: { id: true, name: true, slug: true },
+            })
+          : [],
+        brandIds.length
+          ? prisma.brand.findMany({
+              where: { id: { in: brandIds } },
+              select: { id: true, name: true, slug: true, logo: true },
+            })
+          : [],
       ]);
 
-      console.log(`[getProducts/random] resolved cats: ${cats.length}, brands: ${brands.length}`);
+      console.log(
+        `[getProducts/random] resolved cats: ${cats.length}, brands: ${brands.length}`,
+      );
 
       const catMap = Object.fromEntries(cats.map((c) => [c.id, c]));
       const brandMap = Object.fromEntries(brands.map((b) => [b.id, b]));
 
       products = rawProducts.map((p: any) => {
-        const id      = extractOid(p._id);
-        const catId   = extractOid(p.categoryId);
+        const id = extractOid(p._id);
+        const catId = extractOid(p.categoryId);
         const brandId = extractOid(p.brandId);
         return {
           ...p,
           id,
           categoryId: catId,
           brandId,
-          category:  catId   ? (catMap[catId]     ?? null) : null,
-          brand:     brandId ? (brandMap[brandId]  ?? null) : null,
+          category: catId ? (catMap[catId] ?? null) : null,
+          brand: brandId ? (brandMap[brandId] ?? null) : null,
           _count: { reviews: 0 },
         };
       });
-
     } else {
       // Normal sorting — run products + count in parallel
       const orderBy: any = {
-        newest:      { createdAt: "desc" },
-        oldest:      { createdAt: "asc" },
+        newest: { createdAt: "desc" },
+        oldest: { createdAt: "asc" },
         "price-asc": { price: "asc" },
-        "price-desc":{ price: "desc" },
-        "name-asc":  { name: "asc" },
+        "price-desc": { price: "desc" },
+        "name-asc": { name: "asc" },
         "name-desc": { name: "desc" },
-        popular:     { salesCount: "desc" },
+        popular: { salesCount: "desc" },
       }[sort as string] || { createdAt: "desc" };
 
       [products, total] = await Promise.all([
@@ -716,7 +777,16 @@ export const getProducts = async (
     res.status(200).json({
       success: true,
       data: {
-        products,
+        // Compute stockStatus from live DB values — not stored in DB, derived here.
+        products: products.map((p: any) => ({
+          ...p,
+          stockStatus:
+            p.stockQuantity <= 0
+              ? "OUT_OF_STOCK"
+              : p.stockQuantity <= p.lowStockThreshold
+                ? "LOW_STOCK"
+                : "IN_STOCK",
+        })),
         pagination: {
           page: Number(page),
           limit: Number(limit),

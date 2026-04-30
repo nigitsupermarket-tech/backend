@@ -63,21 +63,57 @@ export const initializePayment = async (
 
     const reference = `NGT-${order.orderNumber}-${Date.now()}`;
 
-    const response = await axios.post(
-      "https://api.paystack.co/transaction/initialize",
-      {
-        email: order.customerEmail,
-        amount: Math.round(order.total * 100), // kobo
-        reference,
-        callback_url: `${process.env.CLIENT_URL}/checkout/verify`,
-        metadata: {
-          orderId: order.id,
-          orderNumber: order.orderNumber,
-          customerId: req.user?.userId,
-        },
+    // ── Paystack API call with debug logging ─────────────────────────────────
+    const paystackPayload = {
+      email: order.customerEmail,
+      amount: Math.round(order.total * 100), // kobo
+      reference,
+      callback_url: `${process.env.CLIENT_URL}/checkout/verify`,
+      metadata: {
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        customerId: req.user?.userId,
       },
-      { headers: paystackHeaders() },
-    );
+    };
+
+    console.log("[Paystack] Initializing payment:", {
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      email: order.customerEmail,
+      amount: paystackPayload.amount,
+      reference,
+      callback_url: paystackPayload.callback_url,
+      secretKeyPresent: !!process.env.PAYSTACK_SECRET_KEY,
+      secretKeyPrefix: process.env.PAYSTACK_SECRET_KEY?.slice(0, 8),
+    });
+
+    let response: any;
+    try {
+      response = await axios.post(
+        "https://api.paystack.co/transaction/initialize",
+        paystackPayload,
+        { headers: paystackHeaders(), timeout: 30000 },
+      );
+      console.log("[Paystack] Initialize success:", {
+        status: response.data?.status,
+        hasAuthUrl: !!response.data?.data?.authorization_url,
+      });
+    } catch (paystackErr: any) {
+      console.error("[Paystack] Initialize FAILED:", {
+        code: paystackErr?.code,
+        message: paystackErr?.message,
+        responseStatus: paystackErr?.response?.status,
+        responseData: paystackErr?.response?.data,
+        isTimeout: paystackErr?.code === "ECONNABORTED",
+      });
+      throw new AppError(
+        paystackErr?.code === "ECONNABORTED"
+          ? "Payment gateway timed out. Please try again."
+          : `Payment gateway error: ${paystackErr?.response?.data?.message || paystackErr.message}`,
+        502,
+      );
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     await prisma.order.update({
       where: { id: orderId },

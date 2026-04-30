@@ -323,6 +323,7 @@ model Product {
   cartItems         CartItem[]
   wishlistItems     WishlistItem[]
   inventoryLogs     InventoryLog[]
+  stockApprovals    StockApprovalRequest[]
   posOrderItems     POSOrderItem[]
 
   @@map("products")
@@ -1016,4 +1017,32 @@ model ActivityLog {
   createdAt DateTime @default(now())
 
   @@map("activity_logs")
+}
+
+// ============================================
+// STOCK APPROVAL REQUESTS
+// ============================================
+
+model StockApprovalRequest {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  productId       String   @db.ObjectId
+  productName     String
+  productSku      String
+  requestedBy     String   @db.ObjectId
+  requestedByName String
+  currentQty      Int
+  requestedQty    Int
+  reason          String?
+  source          String   @default("INVENTORY")
+  status          String   @default("PENDING")
+  reviewedBy      String?  @db.ObjectId
+  reviewedByName  String?
+  reviewedAt      DateTime?
+  reviewNote      String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@map("stock_approval_requests")
 }

@@ -221,7 +221,7 @@ export const validateOrder = [
     .withMessage("Shipping address is required"),
 
   body("paymentMethod")
-    .isIn(["PAYSTACK", "CASH_ON_DELIVERY", "BANK_TRANSFER"])
+    .isIn(["PAYSTACK", "BANK_TRANSFER"])
     .withMessage("Invalid payment method"),
 
   handleValidationErrors,

@@ -25,6 +25,7 @@ import analyticsRoutes from "./routes/analytics.routes";
 import marketingRoutes from "./routes/marketing.routes";
 import exportRoutes from "./routes/export.routes";
 import activityRoutes from "./routes/activity.routes";
+import stockApprovalRoutes from "./routes/stockApproval.routes";
 import addressRoutes from "./routes/address.routes";
 import posRoutes from "./routes/pos.routes";
 import wishlistRoutes from "./routes/wishlist.routes";
@@ -68,10 +69,8 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-app.use(`${API_PREFIX}/payment`, paymentRoutes);
-
 // ============================================
-// GLOBAL MIDDLEWARE (after webhook route)
+// GLOBAL MIDDLEWARE
 // ============================================
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
@@ -123,6 +122,7 @@ app.get("/", async (req: Request, res: Response) => {
 app.use(`${API_PREFIX}/auth`, authRoutes);
 app.use(`${API_PREFIX}/users`, userRoutes);
 app.use(`${API_PREFIX}/products`, productRoutes);
+app.use(`${API_PREFIX}/stock-approvals`, stockApprovalRoutes);
 app.use(`${API_PREFIX}/categories`, categoryRoutes);
 app.use(`${API_PREFIX}/brands`, brandRoutes);
 app.use(`${API_PREFIX}/cart`, cartRoutes);
@@ -132,7 +132,7 @@ app.use(`${API_PREFIX}/discounts`, discountRoutes);
 app.use(`${API_PREFIX}/shipping`, shippingRoutes);
 app.use(`${API_PREFIX}/blog`, blogRoutes);
 app.use(`${API_PREFIX}/upload`, uploadRoutes);
-// NOTE: /payment is already registered above (before express.json)
+app.use(`${API_PREFIX}/payment`, paymentRoutes); // webhook uses raw(), rest use json() internally
 app.use(`${API_PREFIX}/settings`, settingsRoutes);
 app.use(`${API_PREFIX}/analytics`, analyticsRoutes);
 app.use(`${API_PREFIX}/activities`, activityRoutes);
