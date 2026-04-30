@@ -19,7 +19,7 @@ const paystackHeaders = () => ({
 // ─── Bank account details from env ───────────────────────────────────────────
 const getBankConfig = () => ({
   bankName: process.env.BANK_NAME || "First Bank Nigeria",
-  accountName: process.env.BANK_ACCOUNT_NAME || "NigiTriple Industry Ltd",
+  accountName: process.env.BANK_ACCOUNT_NAME || "NigitTriple Industry Ltd",
   accountNumber: process.env.BANK_ACCOUNT_NUMBER || "0000000000",
   sortCode: process.env.BANK_SORT_CODE || "", // optional
 });

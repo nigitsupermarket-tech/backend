@@ -37,18 +37,34 @@ export const errorHandler = (
     // Unique constraint violation (P2002)
     if (err.code === "P2002") {
       const fields = (err.meta?.target as string[]) || [];
-      const field = fields[0] || "field";
+      const field = fields[0] || "";
+
+      // Map common internal field names to user-friendly messages
+      // Never expose raw DB field/index names like "c", "sessionId", etc.
+      const friendlyMessages: Record<string, string> = {
+        email: "An account with this email already exists",
+        phone: "This phone number is already registered",
+        slug: "A product with this name already exists",
+        sku: "A product with this SKU already exists",
+        code: "This discount code already exists",
+        orderNumber: "Order number conflict — please try again",
+        // Cart unique index fields — these should never reach the user
+        // but handle gracefully just in case
+        userId: "Cart conflict — please refresh the page",
+        sessionId: "Cart conflict — please refresh the page",
+        c: "Cart conflict — please refresh the page",
+      };
+
+      const message =
+        friendlyMessages[field] ||
+        (field
+          ? `${field.charAt(0).toUpperCase() + field.slice(1)} already exists`
+          : "A duplicate entry was detected");
+
       return void res.status(409).json({
         success: false,
         status: "fail",
-        message: "Duplicate field value",
-        errors: [
-          {
-            field,
-            message: `${field.charAt(0).toUpperCase() + field.slice(1)} already exists`,
-            value: undefined,
-          },
-        ],
+        message,
       });
     }
 
@@ -112,20 +128,24 @@ export const errorHandler = (
     });
   }
 
-  // ─── MongoDB Duplicate Key Error ───────────────────────────────────────
-  if (err.name === "MongoError" && (err as any).code === 11000) {
-    const field = Object.keys((err as any).keyValue || {})[0] || "field";
+  // ─── MongoDB Duplicate Key Error (native driver, outside Prisma) ──────────
+  if (
+    (err.name === "MongoError" || err.name === "MongoServerError") &&
+    (err as any).code === 11000
+  ) {
+    const keyValue = (err as any).keyValue || {};
+    const field = Object.keys(keyValue)[0] || "";
+    const cartFields = ["c", "userId", "sessionId", "cartId"];
+    const message = cartFields.includes(field)
+      ? "Cart conflict — please refresh the page"
+      : field
+        ? `${field.charAt(0).toUpperCase() + field.slice(1)} already exists`
+        : "A duplicate entry was detected";
+
     return void res.status(409).json({
       success: false,
       status: "fail",
-      message: "Duplicate field value",
-      errors: [
-        {
-          field,
-          message: `${field.charAt(0).toUpperCase() + field.slice(1)} already exists`,
-          value: (err as any).keyValue?.[field],
-        },
-      ],
+      message,
     });
   }
 

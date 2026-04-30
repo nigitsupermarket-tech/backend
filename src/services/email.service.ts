@@ -427,7 +427,7 @@ export async function sendBankTransferInstructionsEmail(
 
   await sendEmail({
     to: email,
-    subject: `Payment Instructions – Order ${orderNumber} – NigiTriple`,
+    subject: `Payment Instructions – Order ${orderNumber} – NigitTriple`,
     html,
     text: `Hi ${name}, please transfer ₦${orderTotal.toLocaleString()} to ${bank.bankName}, Account: ${bank.accountNumber} (${bank.accountName}). Use ${orderNumber} as your reference. Then upload proof of payment on the website.`,
   });
@@ -471,7 +471,7 @@ export async function sendBankTransferConfirmedEmail(
 
   await sendEmail({
     to: email,
-    subject: `Payment Confirmed – Order ${orderNumber} – NigiTriple`,
+    subject: `Payment Confirmed – Order ${orderNumber} – NigitTriple`,
     html,
     text: `Hi ${name}, your bank transfer for order ${orderNumber} (₦${orderTotal.toLocaleString()}) has been confirmed. Your order is now being processed.`,
   });

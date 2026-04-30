@@ -17,17 +17,16 @@ async function findOrCreateCart(
   let cart = await prisma.cart.findFirst({ where });
   if (cart) return cart;
 
-  // No cart found — try to create. Catch unique constraint violation which
-  // means another concurrent request already created it; retry the find.
+  // No cart found — try to create.
   try {
     cart = await prisma.cart.create({
       data: userId ? { userId } : { sessionId },
     });
     return cart;
   } catch (err: any) {
-    if (err?.code === "P2002") {
-      // Race condition: another request created the cart between our find and create.
-      // Retry the find — it must exist now.
+    // P2002 = unique constraint violation: another concurrent request already
+    // created this cart. Retry the find — it must exist now.
+    if (err?.code === "P2002" || err?.code === 11000) {
       const existing = await prisma.cart.findFirst({ where });
       if (existing) return existing;
     }
@@ -120,10 +119,13 @@ export const addToCart = async (
     });
     if (!product) throw new NotFoundError("Product not found");
     if (product.status !== "ACTIVE")
-      throw new AppError("Product is not available", 400);
+      throw new AppError("This product is currently unavailable", 400);
     if (!product.allowBackorder && product.stockQuantity < quantity) {
+      if (product.stockQuantity === 0) {
+        throw new AppError(`${product.name} is out of stock`, 400);
+      }
       throw new AppError(
-        `Only ${product.stockQuantity} item(s) available in stock`,
+        `Only ${product.stockQuantity} unit${product.stockQuantity === 1 ? "" : "s"} of ${product.name} available`,
         400,
       );
     }
@@ -139,8 +141,15 @@ export const addToCart = async (
     if (existingItem) {
       const newQty = existingItem.quantity + quantity;
       if (!product.allowBackorder && product.stockQuantity < newQty) {
+        const available = product.stockQuantity - existingItem.quantity;
+        if (available <= 0) {
+          throw new AppError(
+            `You already have all available stock of ${product.name} in your cart`,
+            400,
+          );
+        }
         throw new AppError(
-          `Only ${product.stockQuantity} item(s) available`,
+          `Only ${available} more unit${available === 1 ? "" : "s"} of ${product.name} can be added`,
           400,
         );
       }

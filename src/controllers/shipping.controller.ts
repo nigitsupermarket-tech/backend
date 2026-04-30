@@ -1,5 +1,5 @@
 // backend/src/controllers/shipping.controller.ts
-// Complete shipment, logistics & tracking system for NigiTriple
+// Complete shipment, logistics & tracking system for NigitTriple
 // Covers: Zones · Methods (TABLE_RATE / FLAT_RATE / STORE_PICKUP) · Weight-based pricing
 //         Shipment creation · Tracking updates · Dashboard stats · Seed data
 
@@ -229,13 +229,11 @@ export const createShippingZone = async (
     });
   } catch (error) {
     if (error instanceof z.ZodError)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Validation error",
-          errors: error.issues,
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Validation error",
+        errors: error.issues,
+      });
     next(error);
   }
 };
@@ -275,13 +273,11 @@ export const updateShippingZone = async (
     });
   } catch (error) {
     if (error instanceof z.ZodError)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Validation error",
-          errors: error.issues,
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Validation error",
+        errors: error.issues,
+      });
     next(error);
   }
 };
@@ -399,13 +395,11 @@ export const createShippingMethod = async (
     });
   } catch (error) {
     if (error instanceof z.ZodError)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Validation error",
-          errors: error.issues,
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Validation error",
+        errors: error.issues,
+      });
     next(error);
   }
 };
@@ -538,13 +532,11 @@ export const updateShippingMethod = async (
     });
   } catch (error) {
     if (error instanceof z.ZodError)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Validation error",
-          errors: error.issues,
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Validation error",
+        errors: error.issues,
+      });
     next(error);
   }
 };
@@ -690,13 +682,11 @@ export const calculateShipping = async (
     });
   } catch (error) {
     if (error instanceof z.ZodError)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Validation error",
-          errors: error.issues,
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Validation error",
+        errors: error.issues,
+      });
     next(error);
   }
 };
@@ -786,13 +776,11 @@ export const createShipment = async (
     });
   } catch (error) {
     if (error instanceof z.ZodError)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Validation error",
-          errors: error.issues,
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Validation error",
+        errors: error.issues,
+      });
     next(error);
   }
 };
@@ -1094,13 +1082,11 @@ export const addTrackingEvent = async (
     });
   } catch (error) {
     if (error instanceof z.ZodError)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Validation error",
-          errors: error.issues,
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Validation error",
+        errors: error.issues,
+      });
     next(error);
   }
 };
@@ -1268,7 +1254,7 @@ export const markDelivered = async (
         data: {
           orderId,
           status: "Delivered",
-          message: `Your order has been delivered${deliveredTo ? ` to ${deliveredTo}` : ""}. Thank you for shopping with NigiTriple!`,
+          message: `Your order has been delivered${deliveredTo ? ` to ${deliveredTo}` : ""}. Thank you for shopping with NigitTriple!`,
           location: location || undefined,
           timestamp: new Date(),
         },
@@ -1617,7 +1603,7 @@ export const seedShippingData = async (
         estimatedMinDays: 0,
         estimatedMaxDays: 1,
         storeAddress: {
-          name: "NigiTriple Port Harcourt Store",
+          name: "NigitTriple Port Harcourt Store",
           address: "5 Rumuola Road, Rumuola",
           city: "Port Harcourt",
           phone: "+234 801 234 5678",
