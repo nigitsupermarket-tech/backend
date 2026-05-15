@@ -8,10 +8,11 @@ import {
   updateHeroBanners,
   updateCardHeroSlides,
   updateTrustBadges,
-  updateAboutUs, // NEW
-  updateContactPage, // NEW
+  updateAboutUs,
+  updateContactPage,
   updatePrivacy,
   updateTerms,
+  updateNotifications,
 } from "../controllers/settings.controller";
 import {
   protect,
@@ -36,5 +37,6 @@ router.put("/contact-page", protect, adminOnly, updateContactPage);
 
 router.put("/privacy", protect, adminOnly, updatePrivacy);
 router.put("/terms", protect, adminOnly, updateTerms);
+router.put("/notifications", protect, adminOnly, updateNotifications);
 
 export default router;

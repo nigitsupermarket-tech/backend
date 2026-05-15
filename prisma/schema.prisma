@@ -111,6 +111,9 @@ model SiteSetting {
   smsApiKey         String?
   smsSenderId       String?
 
+  // Admin Notification Emails
+  adminNotificationEmails String[] @default([])
+
   // Payment Settings
   paystackPublicKey String?
   paystackSecretKey String?

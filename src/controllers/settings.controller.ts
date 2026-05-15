@@ -120,6 +120,7 @@ export const updateSettings = async (
       "maintenanceMessage",
       "allowGuestCheckout",
       "hidePricing",
+      "adminNotificationEmails", // JSON array of emails that receive admin alerts
     ];
 
     // ✅ Only keep valid fields and remove undefined/empty strings
@@ -584,6 +585,53 @@ export const updateTerms = async (
     res.status(200).json({
       success: true,
       message: "Terms of service updated",
+      data: { settings: updated },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// PUT /api/v1/settings/notifications
+// Manages the list of admin emails that receive notification alerts
+export const updateNotifications = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { adminNotificationEmails } = req.body;
+
+    // Validate — must be an array of valid email strings
+    if (!Array.isArray(adminNotificationEmails)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "adminNotificationEmails must be an array" });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const invalid = adminNotificationEmails.filter(
+      (e: any) => typeof e !== "string" || !emailRegex.test(e.trim()),
+    );
+    if (invalid.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid email address(es): ${invalid.join(", ")}`,
+      });
+    }
+
+    let settings = await prisma.siteSetting.findFirst();
+    if (!settings) settings = await prisma.siteSetting.create({ data: {} });
+
+    const updated = await prisma.siteSetting.update({
+      where: { id: settings.id },
+      data: { adminNotificationEmails: adminNotificationEmails.map((e: string) => e.trim()) },
+    });
+
+    invalidateSettingsCache();
+    res.status(200).json({
+      success: true,
+      message: "Notification settings updated",
       data: { settings: updated },
     });
   } catch (error) {

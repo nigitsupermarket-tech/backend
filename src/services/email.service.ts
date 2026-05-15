@@ -476,3 +476,57 @@ export async function sendBankTransferConfirmedEmail(
     text: `Hi ${name}, your bank transfer for order ${orderNumber} (₦${orderTotal.toLocaleString()}) has been confirmed. Your order is now being processed.`,
   });
 }
+
+/**
+ * Admin new-order notification email
+ * Sent to every address in settings.adminNotificationEmails when a customer
+ * places an online order.
+ */
+export async function sendAdminNewOrderEmail(
+  adminEmails: string[],
+  orderNumber: string,
+  customerName: string,
+  customerEmail: string,
+  orderTotal: number,
+  itemCount: number,
+): Promise<void> {
+  if (!adminEmails || adminEmails.length === 0) return;
+
+  const adminOrderUrl = `${process.env.ADMIN_URL || process.env.CLIENT_URL}/admin/orders`;
+
+  const html = `
+    <!DOCTYPE html><html><head><meta charset="utf-8"><style>${baseStyles}
+      .order-box { background:#f0fdf4; border:1px solid #86efac; border-radius:8px; padding:20px; margin:20px 0; }
+      .badge { display:inline-block; background:${BRAND_GREEN_LIGHT}; color:#fff; font-weight:700; font-size:13px; padding:3px 10px; border-radius:99px; }
+    </style></head>
+    <body><div class="wrapper"><div class="container">
+      <div class="header"><h1>🛒 New Online Order</h1></div>
+      <div class="content">
+        <p>A new order has been placed on the website and is awaiting processing.</p>
+        <div class="order-box">
+          <p style="margin:0 0 8px;"><strong>Order Number:</strong> <span class="badge">${orderNumber}</span></p>
+          <p style="margin:0 0 8px;"><strong>Customer:</strong> ${customerName} (${customerEmail})</p>
+          <p style="margin:0 0 8px;"><strong>Items:</strong> ${itemCount} item${itemCount !== 1 ? "s" : ""}</p>
+          <p style="margin:0;"><strong>Order Total:</strong> ₦${orderTotal.toLocaleString("en-NG", { minimumFractionDigits: 2 })}</p>
+        </div>
+        <p style="text-align:center;margin:28px 0;">
+          <a href="${adminOrderUrl}" class="button">View Orders in Admin</a>
+        </p>
+        <p class="note">This is an automated notification. Do not reply to this email.</p>
+      </div>
+      <div class="footer"><p>© ${new Date().getFullYear()} Nigittriple Industry. All rights reserved.</p></div>
+    </div></div></body></html>
+  `;
+
+  // Send to all configured admin notification emails in parallel
+  await Promise.allSettled(
+    adminEmails.map((adminEmail) =>
+      sendEmail({
+        to: adminEmail,
+        subject: `New Order: ${orderNumber} – ₦${orderTotal.toLocaleString("en-NG")}`,
+        html,
+        text: `New order ${orderNumber} placed by ${customerName} (${customerEmail}). Total: ₦${orderTotal.toLocaleString()}. ${itemCount} item(s). View orders at: ${adminOrderUrl}`,
+      }),
+    ),
+  );
+}

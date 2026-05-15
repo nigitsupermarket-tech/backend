@@ -5,6 +5,7 @@ import { AuthRequest } from "../middlewares/auth.middleware";
 import {
   sendOrderConfirmationEmail,
   sendTrackingUpdateEmail,
+  sendAdminNewOrderEmail,
 } from "../services/email.service";
 
 const generateOrderNumber = () =>
@@ -490,6 +491,22 @@ export const createOrder = async (
       order.orderNumber,
       total,
     ).catch((err) => console.error("[email] Order confirmation failed:", err));
+
+    // Notify admin notification emails (configured in Settings → Notifications)
+    prisma.siteSetting.findFirst()
+      .then((cfg) => {
+        const adminEmails: string[] = (cfg as any)?.adminNotificationEmails ?? [];
+        if (adminEmails.length === 0) return;
+        return sendAdminNewOrderEmail(
+          adminEmails,
+          order.orderNumber,
+          user.name,
+          user.email,
+          total,
+          order.items?.length ?? 0,
+        );
+      })
+      .catch((err) => console.error("[email] Admin order notification failed:", err));
 
     res.status(201).json({
       success: true,
