@@ -3,6 +3,7 @@ import { Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import { sendAdminStockNotificationEmail } from "../services/email.service";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/v1/stock-approvals
@@ -46,6 +47,24 @@ export const createStockRequest = async (
           reference: `admin:${req.user!.userId}`,
         },
       });
+
+      // Notify admin notification emails (fire-and-forget)
+      prisma.siteSetting.findFirst().then((cfg) => {
+        const adminEmails: string[] = (cfg as any)?.adminNotificationEmails ?? [];
+        if (adminEmails.length === 0) return;
+        sendAdminStockNotificationEmail(adminEmails, {
+          productName: product.name,
+          productSku: product.sku,
+          requestedBy: user.name,
+          requestedByRole: req.user!.role,
+          currentQty: product.stockQuantity,
+          requestedQty,
+          reason,
+          source: source || "INVENTORY",
+          autoApproved: true,
+        }).catch((err) => console.error("[email] Stock notification failed:", err));
+      }).catch(() => {});
+
       return res.status(200).json({
         success: true,
         message: "Stock updated immediately (admin)",
@@ -68,6 +87,23 @@ export const createStockRequest = async (
         status: "PENDING",
       },
     });
+
+    // Notify admin notification emails (fire-and-forget)
+    prisma.siteSetting.findFirst().then((cfg) => {
+      const adminEmails: string[] = (cfg as any)?.adminNotificationEmails ?? [];
+      if (adminEmails.length === 0) return;
+      sendAdminStockNotificationEmail(adminEmails, {
+        productName: product.name,
+        productSku: product.sku,
+        requestedBy: user.name,
+        requestedByRole: req.user!.role,
+        currentQty: product.stockQuantity,
+        requestedQty,
+        reason,
+        source: source || "INVENTORY",
+        autoApproved: false,
+      }).catch((err) => console.error("[email] Stock notification failed:", err));
+    }).catch(() => {});
 
     res.status(201).json({
       success: true,

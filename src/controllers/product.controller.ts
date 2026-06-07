@@ -332,6 +332,12 @@ export const updateProduct = async (
 
     const { slug, sku, categoryId, ...rest } = req.body;
 
+    // Security: only admins can directly set stockQuantity via this endpoint.
+    // Staff and Sales must go through the stock-approval workflow.
+    if (req.user?.role !== "ADMIN") {
+      delete rest.stockQuantity;
+    }
+
     // If a new images array is supplied, delete any URLs that were removed
     if (Array.isArray(rest.images) && product.images.length > 0) {
       const newImageSet = new Set(rest.images as string[]);

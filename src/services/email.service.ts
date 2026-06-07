@@ -530,3 +530,74 @@ export async function sendAdminNewOrderEmail(
     ),
   );
 }
+
+/**
+ * Admin stock modification notification email
+ * Sent to every address in settings.adminNotificationEmails when any user
+ * submits a stock change request (Staff/Sales → pending, Admin → auto-approved).
+ */
+export async function sendAdminStockNotificationEmail(
+  adminEmails: string[],
+  params: {
+    productName: string;
+    productSku: string;
+    requestedBy: string;
+    requestedByRole: string;
+    currentQty: number;
+    requestedQty: number;
+    reason?: string;
+    source: string;
+    autoApproved: boolean;
+  },
+): Promise<void> {
+  if (!adminEmails || adminEmails.length === 0) return;
+
+  const adminStockUrl = `${process.env.ADMIN_URL || process.env.CLIENT_URL}/admin/stock-approvals`;
+  const diff = params.requestedQty - params.currentQty;
+  const diffLabel = diff > 0 ? `+${diff}` : `${diff}`;
+  const statusBadge = params.autoApproved
+    ? `<span style="color:#16a34a;font-weight:700;">AUTO-APPROVED</span>`
+    : `<span style="color:#d97706;font-weight:700;">PENDING APPROVAL</span>`;
+
+  const html = `
+    <!DOCTYPE html><html><head><meta charset="utf-8"><style>${baseStyles}
+      .stock-box { background:#f0fdf4; border:1px solid #86efac; border-radius:8px; padding:20px; margin:20px 0; }
+      .badge { display:inline-block; font-weight:700; font-size:13px; padding:3px 10px; border-radius:99px; }
+    </style></head>
+    <body><div class="wrapper"><div class="container">
+      <div class="header"><h1>📦 Stock Modification Alert</h1></div>
+      <div class="content">
+        <p>A stock quantity change has been ${params.autoApproved ? "applied" : "requested"} on the system.</p>
+        <div class="stock-box">
+          <p style="margin:0 0 8px;"><strong>Product:</strong> ${params.productName} <span style="color:#6b7280;font-size:12px;">(${params.productSku})</span></p>
+          <p style="margin:0 0 8px;"><strong>Modified by:</strong> ${params.requestedBy} <span style="color:#6b7280;font-size:12px;">(${params.requestedByRole})</span></p>
+          <p style="margin:0 0 8px;"><strong>Change:</strong> ${params.currentQty} → ${params.requestedQty} units <span style="color:${diff > 0 ? "#16a34a" : "#dc2626"};font-weight:700;">(${diffLabel})</span></p>
+          ${params.reason ? `<p style="margin:0 0 8px;"><strong>Reason:</strong> ${params.reason}</p>` : ""}
+          <p style="margin:0 0 8px;"><strong>Source:</strong> ${params.source}</p>
+          <p style="margin:0;"><strong>Status:</strong> ${statusBadge}</p>
+        </div>
+        ${!params.autoApproved ? `
+        <p style="text-align:center;margin:28px 0;">
+          <a href="${adminStockUrl}" class="button">Review in Admin</a>
+        </p>` : ""}
+        <p class="note">This is an automated security notification. Do not reply to this email.</p>
+      </div>
+      <div class="footer"><p>© ${new Date().getFullYear()} Nigittriple Industry. All rights reserved.</p></div>
+    </div></div></body></html>
+  `;
+
+  const subject = params.autoApproved
+    ? `Stock Updated: ${params.productName} (${diffLabel} units) by ${params.requestedBy}`
+    : `Stock Change Request: ${params.productName} by ${params.requestedBy} — Awaiting Approval`;
+
+  await Promise.allSettled(
+    adminEmails.map((adminEmail) =>
+      sendEmail({
+        to: adminEmail,
+        subject,
+        html,
+        text: `Stock change by ${params.requestedBy} (${params.requestedByRole}): ${params.productName} (${params.productSku}) — ${params.currentQty} → ${params.requestedQty} (${diffLabel}). Status: ${params.autoApproved ? "AUTO-APPROVED" : "PENDING APPROVAL"}. Reason: ${params.reason || "N/A"}`,
+      }),
+    ),
+  );
+}
