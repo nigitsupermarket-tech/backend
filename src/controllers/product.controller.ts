@@ -568,12 +568,12 @@ export const getProducts = async (
 
     const where: any = {};
 
-    // Respect status filter — default to ACTIVE for storefront, all for admin
-    if (status && status !== "ALL") {
-      where.status = status as string;
-    } else if (!status) {
-      where.status = "ACTIVE";
+    // Respect status filter — omit clause entirely for "all" to fetch every status
+    const statusUpper = (status as string | undefined)?.toUpperCase();
+    if (statusUpper && statusUpper !== "ALL") {
+      where.status = statusUpper; // e.g. "ACTIVE", "DRAFT", "OUT_OF_STOCK"
     }
+    // "all" or missing → no status filter → admin sees every product
 
     if (search) {
       where.OR = [
