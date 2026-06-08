@@ -3,6 +3,7 @@ import { Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import { log as logActivity } from "../utils/activityLogger";
 import { sendAdminStockNotificationEmail } from "../services/email.service";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +105,15 @@ export const createStockRequest = async (
         autoApproved: false,
       }).catch((err) => console.error("[email] Stock notification failed:", err));
     }).catch(() => {});
+
+    logActivity({
+      userId: req.user!.userId,
+      action: "request stock change",
+      entity: "product",
+      entityId: productId,
+      metadata: { productName: product.name, productSku: product.sku, currentQty: product.stockQuantity, requestedQty, reason, source },
+      req,
+    });
 
     res.status(201).json({
       success: true,
@@ -240,6 +250,15 @@ export const approveStockRequest = async (
       }),
     ]);
 
+    logActivity({
+      userId: req.user!.userId,
+      action: "approve stock change",
+      entity: "product",
+      entityId: request.productId,
+      metadata: { productName: request.productName, productSku: request.productSku, from: request.currentQty, to: request.requestedQty, requestedBy: request.requestedByName },
+      req,
+    });
+
     res
       .status(200)
       .json({ success: true, message: "Request approved and stock updated" });
@@ -281,6 +300,15 @@ export const rejectStockRequest = async (
         reviewedAt: new Date(),
         reviewNote: reviewNote || null,
       },
+    });
+
+    logActivity({
+      userId: req.user!.userId,
+      action: "reject stock change",
+      entity: "product",
+      entityId: request.productId,
+      metadata: { productName: request.productName, productSku: request.productSku, requestedBy: request.requestedByName, reviewNote },
+      req,
     });
 
     res.status(200).json({ success: true, message: "Request rejected" });

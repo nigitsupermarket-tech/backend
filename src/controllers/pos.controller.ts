@@ -3,6 +3,7 @@ import { Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import { log as logActivity } from "../utils/activityLogger";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -139,6 +140,15 @@ export const createPOSOrder = async (
       }
 
       return order;
+    });
+
+    logActivity({
+      userId: req.user?.userId,
+      action: "create POS sale",
+      entity: "order",
+      entityId: posOrder.id,
+      metadata: { posOrderNumber, total: posOrder.total, paymentMethod: posOrder.paymentMethod, customerName: posOrder.customerName || "Walk-In" },
+      req,
     });
 
     res.status(201).json({
@@ -437,6 +447,15 @@ export const openPOSSession = async (
       data: { staffId: req.user.userId, openingFloat, status: "OPEN" },
     });
 
+    logActivity({
+      userId: req.user?.userId,
+      action: "open POS session",
+      entity: "session",
+      entityId: session.id,
+      metadata: { openingFloat },
+      req,
+    });
+
     res.status(201).json({
       success: true,
       message: "POS session opened",
@@ -523,6 +542,20 @@ export const closePOSSession = async (
         notes: notes ?? null,
         status: "CLOSED",
       },
+    });
+
+    logActivity({
+      userId: req.user?.userId,
+      action: "close POS session",
+      entity: "session",
+      entityId: id,
+      metadata: {
+        totalOrders: updated.totalOrders,
+        totalSales: updated.totalSales,
+        closingFloat: updated.closingFloat,
+        variance: updated.variance,
+      },
+      req,
     });
 
     res.status(200).json({

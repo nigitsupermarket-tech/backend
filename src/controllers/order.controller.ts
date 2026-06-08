@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import { log as logActivity } from "../utils/activityLogger";
 import {
   sendOrderConfirmationEmail,
   sendTrackingUpdateEmail,
@@ -157,6 +158,15 @@ export const updateOrderStatus = async (
         });
       }
     }
+
+    logActivity({
+      userId: req.user?.userId,
+      action: `update order status → ${status}`,
+      entity: "order",
+      entityId: id,
+      metadata: { orderNumber: order.orderNumber, previousStatus: order.status, newStatus: status, notes },
+      req,
+    });
 
     res.status(200).json({
       success: true,
@@ -507,6 +517,15 @@ export const createOrder = async (
         );
       })
       .catch((err) => console.error("[email] Admin order notification failed:", err));
+
+    logActivity({
+      userId: (req as AuthRequest).user?.userId,
+      action: "create order",
+      entity: "order",
+      entityId: order.id,
+      metadata: { orderNumber: order.orderNumber, total: order.total },
+      req,
+    });
 
     res.status(201).json({
       success: true,

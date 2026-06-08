@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AuthRequest } from "../middlewares/auth.middleware";
 import { deleteCloudinaryImage } from "../lib/cloudinary";
+import { log as logActivity } from "../utils/activityLogger";
 
 // ── In-memory settings cache ──────────────────────────────────────────────────
 // /api/v1/settings was being called 4-6 times per page load and took 2500ms
@@ -151,6 +152,15 @@ export const updateSettings = async (
     });
 
     invalidateSettingsCache();
+
+    logActivity({
+      userId: (req as AuthRequest).user?.userId,
+      action: "update settings",
+      entity: "settings",
+      metadata: { changedFields: Object.keys(data) },
+      req,
+    });
+
     res.status(200).json({
       success: true,
       message: "Settings updated",

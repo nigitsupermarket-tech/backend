@@ -9,6 +9,7 @@ import { parse } from "csv-parse/sync";
 import { stringify } from "csv-stringify/sync";
 import https from "https";
 import http from "http";
+import { log as logActivity } from "../utils/activityLogger";
 
 // ── helper: collect PDFDocument into Buffer ───────────────────────────────────
 function pdfToBuffer(doc: InstanceType<typeof PDFDocument>): Promise<Buffer> {
@@ -380,7 +381,9 @@ export const importProductsCSV = async (
                 requestedByName: user.name,
                 currentQty: existing.stockQuantity,
                 requestedQty,
-                reason: row.reason || `CSV import by ${user.name} (${req.user!.role})`,
+                reason:
+                  row.reason ||
+                  `CSV import by ${user.name} (${req.user!.role})`,
                 source: "CSV_IMPORT",
                 status: "PENDING",
               },
@@ -392,33 +395,66 @@ export const importProductsCSV = async (
           if (existing) {
             const safeData: any = {};
             if (row.name) safeData.name = row.name;
-            if (row.price) safeData.price = parseFloat(row.price) || existing.stockQuantity;
-            if (row.comparePrice !== undefined) safeData.comparePrice = row.comparePrice ? parseFloat(row.comparePrice) : null;
-            if (row.costPrice !== undefined) safeData.costPrice = row.costPrice ? parseFloat(row.costPrice) : null;
-            if (row.lowStockThreshold) safeData.lowStockThreshold = parseInt(row.lowStockThreshold) || 5;
+            if (row.price)
+              safeData.price = parseFloat(row.price) || existing.stockQuantity;
+            if (row.comparePrice !== undefined)
+              safeData.comparePrice = row.comparePrice
+                ? parseFloat(row.comparePrice)
+                : null;
+            if (row.costPrice !== undefined)
+              safeData.costPrice = row.costPrice
+                ? parseFloat(row.costPrice)
+                : null;
+            if (row.lowStockThreshold)
+              safeData.lowStockThreshold = parseInt(row.lowStockThreshold) || 5;
             if (row.status) safeData.status = row.status;
-            if (row.description !== undefined) safeData.description = row.description || null;
-            if (row.shortDescription !== undefined) safeData.shortDescription = row.shortDescription || null;
-            if (row.isFeatured !== undefined) safeData.isFeatured = row.isFeatured === "true";
-            if (row.isNewArrival !== undefined) safeData.isNewArrival = row.isNewArrival === "true";
-            if (row.isOnPromotion !== undefined) safeData.isOnPromotion = row.isOnPromotion === "true";
+            if (row.description !== undefined)
+              safeData.description = row.description || null;
+            if (row.shortDescription !== undefined)
+              safeData.shortDescription = row.shortDescription || null;
+            if (row.isFeatured !== undefined)
+              safeData.isFeatured = row.isFeatured === "true";
+            if (row.isNewArrival !== undefined)
+              safeData.isNewArrival = row.isNewArrival === "true";
+            if (row.isOnPromotion !== undefined)
+              safeData.isOnPromotion = row.isOnPromotion === "true";
             if (row.tags) safeData.tags = row.tags.split("|").filter(Boolean);
-            if (row.barcode !== undefined) safeData.barcode = row.barcode || null;
-            if (row.netWeight !== undefined) safeData.netWeight = row.netWeight || null;
-            if (row.unitsPerCarton !== undefined) safeData.unitsPerCarton = row.unitsPerCarton ? parseInt(row.unitsPerCarton) : null;
+            if (row.barcode !== undefined)
+              safeData.barcode = row.barcode || null;
+            if (row.netWeight !== undefined)
+              safeData.netWeight = row.netWeight || null;
+            if (row.unitsPerCarton !== undefined)
+              safeData.unitsPerCarton = row.unitsPerCarton
+                ? parseInt(row.unitsPerCarton)
+                : null;
             if (row.origin !== undefined) safeData.origin = row.origin || null;
-            if (row.weight !== undefined) safeData.weight = row.weight ? parseFloat(row.weight) : null;
-            if (row.isHalal !== undefined) safeData.isHalal = row.isHalal === "true";
-            if (row.isOrganic !== undefined) safeData.isOrganic = row.isOrganic === "true";
-            if (row.isKosher !== undefined) safeData.isKosher = row.isKosher === "true";
-            if (row.isVegan !== undefined) safeData.isVegan = row.isVegan === "true";
-            if (row.isGlutenFree !== undefined) safeData.isGlutenFree = row.isGlutenFree === "true";
-            if (row.naifdaNumber !== undefined) safeData.naifdaNumber = row.naifdaNumber || null;
-            if (row.storageInstructions !== undefined) safeData.storageInstructions = row.storageInstructions || null;
-            if (row.ingredients !== undefined) safeData.ingredients = row.ingredients || null;
-            if (row.allergens !== undefined) safeData.allergens = row.allergens ? row.allergens.split("|").filter(Boolean) : [];
+            if (row.weight !== undefined)
+              safeData.weight = row.weight ? parseFloat(row.weight) : null;
+            if (row.isHalal !== undefined)
+              safeData.isHalal = row.isHalal === "true";
+            if (row.isOrganic !== undefined)
+              safeData.isOrganic = row.isOrganic === "true";
+            if (row.isKosher !== undefined)
+              safeData.isKosher = row.isKosher === "true";
+            if (row.isVegan !== undefined)
+              safeData.isVegan = row.isVegan === "true";
+            if (row.isGlutenFree !== undefined)
+              safeData.isGlutenFree = row.isGlutenFree === "true";
+            if (row.naifdaNumber !== undefined)
+              safeData.naifdaNumber = row.naifdaNumber || null;
+            if (row.storageInstructions !== undefined)
+              safeData.storageInstructions = row.storageInstructions || null;
+            if (row.ingredients !== undefined)
+              safeData.ingredients = row.ingredients || null;
+            if (row.allergens !== undefined)
+              safeData.allergens = row.allergens
+                ? row.allergens.split("|").filter(Boolean)
+                : [];
             if (Object.keys(safeData).length > 0) {
-              await prisma.product.update({ where: { sku: row.sku }, data: safeData });
+              await prisma.product.update({
+                where: { sku: row.sku },
+                data: safeData,
+              });
             }
             results.success++;
           } else {
@@ -434,22 +470,30 @@ export const importProductsCSV = async (
 
       // Notify admin emails (fire-and-forget)
       if (results.stockRequests > 0) {
-        prisma.siteSetting.findFirst().then((cfg) => {
-          const adminEmails: string[] = (cfg as any)?.adminNotificationEmails ?? [];
-          if (adminEmails.length === 0) return;
-          const { sendAdminStockNotificationEmail } = require("../services/email.service");
-          sendAdminStockNotificationEmail(adminEmails, {
-            productName: `${results.stockRequests} product(s) via CSV`,
-            productSku: "CSV_IMPORT",
-            requestedBy: user!.name,
-            requestedByRole: req.user!.role,
-            currentQty: 0,
-            requestedQty: 0,
-            reason: `Bulk CSV import — ${results.stockRequests} stock change(s) pending approval`,
-            source: "CSV_IMPORT",
-            autoApproved: false,
-          }).catch((err: any) => console.error("[email] CSV stock notification failed:", err));
-        }).catch(() => {});
+        prisma.siteSetting
+          .findFirst()
+          .then((cfg) => {
+            const adminEmails: string[] =
+              (cfg as any)?.adminNotificationEmails ?? [];
+            if (adminEmails.length === 0) return;
+            const {
+              sendAdminStockNotificationEmail,
+            } = require("../services/email.service");
+            sendAdminStockNotificationEmail(adminEmails, {
+              productName: `${results.stockRequests} product(s) via CSV`,
+              productSku: "CSV_IMPORT",
+              requestedBy: user!.name,
+              requestedByRole: req.user!.role,
+              currentQty: 0,
+              requestedQty: 0,
+              reason: `Bulk CSV import — ${results.stockRequests} stock change(s) pending approval`,
+              source: "CSV_IMPORT",
+              autoApproved: false,
+            }).catch((err: any) =>
+              console.error("[email] CSV stock notification failed:", err),
+            );
+          })
+          .catch(() => {});
       }
 
       return res.status(200).json({
@@ -476,10 +520,16 @@ export const importProductsCSV = async (
         if (existing) {
           await prisma.product.update({ where: { sku: row.sku }, data });
         } else {
-          data.slug = row.slug?.trim() ||
-            row.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+          data.slug =
+            row.slug?.trim() ||
+            row.name
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, "-")
+              .replace(/(^-|-$)/g, "");
           // Ensure slug uniqueness by appending SKU suffix if needed
-          const slugExists = await prisma.product.findUnique({ where: { slug: data.slug } });
+          const slugExists = await prisma.product.findUnique({
+            where: { slug: data.slug },
+          });
           if (slugExists) {
             data.slug = `${data.slug}-${row.sku.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
           }
@@ -492,6 +542,17 @@ export const importProductsCSV = async (
       }
     });
 
+    logActivity({
+      userId: req.user?.userId,
+      action: "import products CSV",
+      entity: "product",
+      metadata: {
+        totalRows: records.length,
+        success: results.success,
+        failed: results.failed,
+      },
+      req,
+    });
 
     res.status(200).json({ success: true, data: results });
   } catch (error) {

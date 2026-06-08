@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import prisma from "../config/database";
 import { AppError, NotFoundError, ConflictError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import { log as logActivity } from "../utils/activityLogger";
 
 export const getUsers = async (
   req: AuthRequest,
@@ -144,6 +145,15 @@ export const createUser = async (
       },
     });
 
+    logActivity({
+      userId: req.user?.userId,
+      action: "create user",
+      entity: "user",
+      entityId: user.id,
+      metadata: { name: user.name, email: user.email, role: user.role },
+      req,
+    });
+
     res.status(201).json({
       success: true,
       message: "User created successfully",
@@ -188,6 +198,15 @@ export const updateUser = async (
       },
     });
 
+    logActivity({
+      userId: req.user?.userId,
+      action: "update user",
+      entity: "user",
+      entityId: user.id,
+      metadata: { changedFields: Object.keys(updates), targetName: user.name },
+      req,
+    });
+
     res
       .status(200)
       .json({ success: true, message: "User updated", data: { user } });
@@ -209,6 +228,15 @@ export const deleteUser = async (
 
     const user = await prisma.user.findUnique({ where: { id } });
     if (!user) throw new NotFoundError("User not found");
+
+    logActivity({
+      userId: req.user?.userId,
+      action: "delete user",
+      entity: "user",
+      entityId: id,
+      metadata: { name: user.name, email: user.email, role: user.role },
+      req,
+    });
 
     await prisma.user.delete({ where: { id } });
     res

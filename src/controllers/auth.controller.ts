@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import { v4 as uuidv4 } from "uuid";
 import prisma from "../config/database";
 import { generateTokens, verifyRefreshToken } from "../utils/jwt";
+import { log as logActivity } from "../utils/activityLogger";
 import {
   AppError,
   UnauthorizedError,
@@ -180,6 +181,14 @@ export const login = async (
     // ✅ Set both tokens as httpOnly cookies (30-day refresh)
     setAuthCookies(res, accessToken, refreshToken);
 
+    logActivity({
+      userId: user.id,
+      action: "login",
+      entity: "session",
+      metadata: { email: user.email, role: user.role },
+      req,
+    });
+
     res.status(200).json({
       success: true,
       message: "Login successful",
@@ -216,6 +225,8 @@ export const logout = async (
     });
 
     clearAuthCookies(res);
+
+    logActivity({ userId: req.user.userId, action: "logout", entity: "session", req });
 
     res.status(200).json({ success: true, message: "Logout successful" });
   } catch (error) {

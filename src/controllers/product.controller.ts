@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import { log as logActivity } from "../utils/activityLogger";
 import {
   deleteCloudinaryImages,
   deleteCloudinaryImage,
@@ -308,6 +309,15 @@ export const createProduct = async (
       });
     }
 
+    logActivity({
+      userId: (req as AuthRequest).user?.userId,
+      action: "create product",
+      entity: "product",
+      entityId: product.id,
+      metadata: { name: product.name, sku: product.sku, status: product.status },
+      req,
+    });
+
     res.status(201).json({
       success: true,
       message: "Product created successfully",
@@ -377,6 +387,15 @@ export const updateProduct = async (
       include: { category: true, brand: true },
     });
 
+    logActivity({
+      userId: (req as AuthRequest).user?.userId,
+      action: "update product",
+      entity: "product",
+      entityId: updated.id,
+      metadata: { name: updated.name, sku: updated.sku, changedFields: Object.keys(rest) },
+      req,
+    });
+
     res.status(200).json({
       success: true,
       message: "Product updated successfully",
@@ -405,6 +424,15 @@ export const deleteProduct = async (
     }
 
     await prisma.product.delete({ where: { id } });
+
+    logActivity({
+      userId: req.user?.userId,
+      action: "delete product",
+      entity: "product",
+      entityId: id,
+      metadata: { name: product.name, sku: product.sku },
+      req,
+    });
 
     res
       .status(200)
