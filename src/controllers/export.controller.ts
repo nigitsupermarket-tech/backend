@@ -57,6 +57,45 @@ function naira(amount: number): string {
 }
 
 // ── EXPORT PRODUCTS CSV ───────────────────────────────────────────────────────
+// ── SHARED: canonical import/export column list ───────────────────────────────
+// This is the single source of truth — both exportProductsCSV and
+// downloadCSVTemplate use exactly these columns in exactly this order.
+const PRODUCT_CSV_COLUMNS = [
+  "name",
+  "slug",
+  "sku",
+  "barcode",
+  "description",
+  "shortDescription",
+  "price",
+  "comparePrice",
+  "costPrice",
+  "stockQuantity",
+  "lowStockThreshold",
+  "categoryId",
+  "brandId",
+  "status",
+  "isFeatured",
+  "isNewArrival",
+  "isOnPromotion",
+  "tags",
+  "images",
+  "netWeight",
+  "unitsPerCarton",
+  "origin",
+  "weight",
+  "isHalal",
+  "isOrganic",
+  "isKosher",
+  "isVegan",
+  "isGlutenFree",
+  "naifdaNumber",
+  "storageInstructions",
+  "ingredients",
+  "allergens",
+] as const;
+
+// ── EXPORT PRODUCTS CSV ───────────────────────────────────────────────────────
 export const exportProductsCSV = async (
   req: AuthRequest,
   res: Response,
@@ -69,10 +108,10 @@ export const exportProductsCSV = async (
     });
 
     const csvData = products.map((p) => ({
-      id: p.id,
       name: p.name,
       slug: p.slug,
       sku: p.sku,
+      barcode: p.barcode || "",
       description: p.description,
       shortDescription: p.shortDescription || "",
       price: p.price,
@@ -80,63 +119,32 @@ export const exportProductsCSV = async (
       costPrice: p.costPrice || "",
       stockQuantity: p.stockQuantity,
       lowStockThreshold: p.lowStockThreshold,
-      category: p.category.name,
       categoryId: p.categoryId,
-      brand: p.brand?.name || "",
       brandId: p.brandId || "",
       status: p.status,
       isFeatured: p.isFeatured,
       isNewArrival: p.isNewArrival,
+      isOnPromotion: p.isOnPromotion,
       tags: p.tags.join("|"),
-      weight: p.weight || "",
       images: p.images.join("|"),
-      barcode: p.barcode || "",
       netWeight: p.netWeight || "",
       unitsPerCarton: p.unitsPerCarton || "",
       origin: p.origin || "",
+      weight: p.weight || "",
       isHalal: p.isHalal,
       isOrganic: p.isOrganic,
-      isOnPromotion: p.isOnPromotion,
-      viewCount: p.viewCount,
-      salesCount: p.salesCount,
-      createdAt: p.createdAt.toISOString(),
+      isKosher: p.isKosher,
+      isVegan: p.isVegan,
+      isGlutenFree: p.isGlutenFree,
+      naifdaNumber: p.naifdaNumber || "",
+      storageInstructions: p.storageInstructions || "",
+      ingredients: p.ingredients || "",
+      allergens: (p.allergens || []).join("|"),
     }));
 
     const csv = stringify(csvData, {
       header: true,
-      columns: [
-        "id",
-        "name",
-        "slug",
-        "sku",
-        "description",
-        "shortDescription",
-        "price",
-        "comparePrice",
-        "costPrice",
-        "stockQuantity",
-        "lowStockThreshold",
-        "category",
-        "categoryId",
-        "brand",
-        "brandId",
-        "status",
-        "isFeatured",
-        "isNewArrival",
-        "tags",
-        "weight",
-        "images",
-        "barcode",
-        "netWeight",
-        "unitsPerCarton",
-        "origin",
-        "isHalal",
-        "isOrganic",
-        "isOnPromotion",
-        "viewCount",
-        "salesCount",
-        "createdAt",
-      ],
+      columns: [...PRODUCT_CSV_COLUMNS],
     });
 
     res.setHeader("Content-Type", "text/csv");
@@ -360,17 +368,40 @@ export const importProductsCSV = async (
               safeData.isFeatured = row.isFeatured === "true";
             if (row.isNewArrival !== undefined)
               safeData.isNewArrival = row.isNewArrival === "true";
+            if (row.isOnPromotion !== undefined)
+              safeData.isOnPromotion = row.isOnPromotion === "true";
             if (row.tags) safeData.tags = row.tags.split("|").filter(Boolean);
             if (row.barcode !== undefined)
               safeData.barcode = row.barcode || null;
             if (row.netWeight !== undefined)
               safeData.netWeight = row.netWeight || null;
+            if (row.unitsPerCarton !== undefined)
+              safeData.unitsPerCarton = row.unitsPerCarton
+                ? parseInt(row.unitsPerCarton)
+                : null;
+            if (row.origin !== undefined) safeData.origin = row.origin || null;
+            if (row.weight !== undefined)
+              safeData.weight = row.weight ? parseFloat(row.weight) : null;
             if (row.isHalal !== undefined)
               safeData.isHalal = row.isHalal === "true";
             if (row.isOrganic !== undefined)
               safeData.isOrganic = row.isOrganic === "true";
-            if (row.isOnPromotion !== undefined)
-              safeData.isOnPromotion = row.isOnPromotion === "true";
+            if (row.isKosher !== undefined)
+              safeData.isKosher = row.isKosher === "true";
+            if (row.isVegan !== undefined)
+              safeData.isVegan = row.isVegan === "true";
+            if (row.isGlutenFree !== undefined)
+              safeData.isGlutenFree = row.isGlutenFree === "true";
+            if (row.naifdaNumber !== undefined)
+              safeData.naifdaNumber = row.naifdaNumber || null;
+            if (row.storageInstructions !== undefined)
+              safeData.storageInstructions = row.storageInstructions || null;
+            if (row.ingredients !== undefined)
+              safeData.ingredients = row.ingredients || null;
+            if (row.allergens !== undefined)
+              safeData.allergens = row.allergens
+                ? row.allergens.split("|").filter(Boolean)
+                : [];
 
             if (Object.keys(safeData).length > 0) {
               await prisma.product.update({
@@ -465,6 +496,7 @@ export const importProductsCSV = async (
           shortDescription: row.shortDescription || null,
           isFeatured: row.isFeatured === "true",
           isNewArrival: row.isNewArrival === "true",
+          isOnPromotion: row.isOnPromotion === "true",
           tags: row.tags ? row.tags.split("|").filter(Boolean) : [],
           images: row.images ? row.images.split("|").filter(Boolean) : [],
           barcode: row.barcode || null,
@@ -473,9 +505,18 @@ export const importProductsCSV = async (
             ? parseInt(row.unitsPerCarton)
             : null,
           origin: row.origin || null,
+          weight: row.weight ? parseFloat(row.weight) : null,
           isHalal: row.isHalal === "true",
           isOrganic: row.isOrganic === "true",
-          isOnPromotion: row.isOnPromotion === "true",
+          isKosher: row.isKosher === "true",
+          isVegan: row.isVegan === "true",
+          isGlutenFree: row.isGlutenFree === "true",
+          naifdaNumber: row.naifdaNumber || null,
+          storageInstructions: row.storageInstructions || null,
+          ingredients: row.ingredients || null,
+          allergens: row.allergens
+            ? row.allergens.split("|").filter(Boolean)
+            : [],
         };
 
         if (existing) {
@@ -512,32 +553,44 @@ export const downloadCSVTemplate = async (
     const template = [
       {
         name: "Example Product",
+        slug: "example-product",
         sku: "PROD-001",
-        description: "Product description",
-        shortDescription: "Short desc",
+        barcode: "5901234123457",
+        description: "Full product description goes here",
+        shortDescription: "Short one-line description",
         price: "5000",
         comparePrice: "6000",
         costPrice: "3000",
         stockQuantity: "100",
         lowStockThreshold: "10",
-        categoryId: "CATEGORY_ID_HERE",
-        brandId: "BRAND_ID_HERE (optional)",
+        categoryId: "PASTE_CATEGORY_ID_HERE",
+        brandId: "PASTE_BRAND_ID_HERE (or leave blank)",
         status: "ACTIVE",
         isFeatured: "false",
         isNewArrival: "false",
-        tags: "tag1|tag2",
-        images: "https://example.com/image1.jpg",
-        barcode: "",
+        isOnPromotion: "false",
+        tags: "tag1|tag2|tag3",
+        images: "https://example.com/image1.jpg|https://example.com/image2.jpg",
         netWeight: "500g",
         unitsPerCarton: "12",
-        origin: "Italy",
+        origin: "Nigeria",
+        weight: "0.5",
         isHalal: "false",
         isOrganic: "false",
-        isOnPromotion: "false",
+        isKosher: "false",
+        isVegan: "false",
+        isGlutenFree: "false",
+        naifdaNumber: "",
+        storageInstructions: "Store in a cool dry place",
+        ingredients: "Ingredient 1, Ingredient 2",
+        allergens: "Nuts|Gluten",
       },
     ];
 
-    const csv = stringify(template, { header: true });
+    const csv = stringify(template, {
+      header: true,
+      columns: [...PRODUCT_CSV_COLUMNS],
+    });
     res.setHeader("Content-Type", "text/csv");
     res.setHeader(
       "Content-Disposition",
