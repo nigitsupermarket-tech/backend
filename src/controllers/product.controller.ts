@@ -566,13 +566,21 @@ export const getProducts = async (
 
     const skip = (Number(page) - 1) * Number(limit);
 
-    const where: any = { status: "ACTIVE" };
+    const where: any = {};
+
+    // Respect status filter — default to ACTIVE for storefront, all for admin
+    if (status && status !== "ALL") {
+      where.status = status as string;
+    } else if (!status) {
+      where.status = "ACTIVE";
+    }
 
     if (search) {
       where.OR = [
         { name: { contains: search as string, mode: "insensitive" } },
         { description: { contains: search as string, mode: "insensitive" } },
         { sku: { contains: search as string, mode: "insensitive" } },
+        { barcode: { contains: search as string, mode: "insensitive" } },
         { tags: { has: search as string } },
       ];
     }
