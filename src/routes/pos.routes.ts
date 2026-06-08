@@ -28,7 +28,7 @@ router.get("/stats", getPOSStats);
 // Sessions
 router.post("/sessions", openPOSSession);
 router.get("/sessions", getPOSSessions);
-router.put("/sessions/:id/close", closePOSSession);   // ← PUT (frontend was sending POST — fix in POS page)
-router.post("/sessions/:id/close", closePOSSession);  // ← also accept POST for backwards compat
+router.put("/sessions/:id/close", closePOSSession); // ← PUT (frontend was sending POST — fix in POS page)
+router.post("/sessions/:id/close", closePOSSession); // ← also accept POST for backwards compat
 
 export default router;
