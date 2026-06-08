@@ -14,7 +14,7 @@ const router = Router();
 // Multer configuration for CSV upload
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB limit — supports large catalogues
   fileFilter: (req, file, cb) => {
     if (file.mimetype === "text/csv" || file.originalname.endsWith(".csv")) {
       cb(null, true);
