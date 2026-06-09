@@ -364,9 +364,9 @@ model InventoryLog {
   id          String   @id @default(auto()) @map("_id") @db.ObjectId
   productId   String   @db.ObjectId
   type        String   // PURCHASE, SALE, ADJUSTMENT, RETURN, POS_SALE, EXPIRY
-  quantity    Int
-  previousQty Int
-  newQty      Int
+  quantity    Float  // Float supports scalable product log entries
+  previousQty Float
+  newQty      Float
   reason      String?
   reference   String?  // Order ID or POS order ID
   createdAt   DateTime @default(now())
@@ -417,7 +417,7 @@ model CartItem {
   id        String   @id @default(auto()) @map("_id") @db.ObjectId
   cartId    String   @db.ObjectId
   productId String   @db.ObjectId
-  quantity  Int      @default(1)
+  quantity  Float    @default(1)   // Float for scalable products (e.g. 1.5 kg)
   price     Float
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -561,8 +561,9 @@ model OrderItem {
   productSku   String
   productImage String?
   netWeight    String?   // Store grocery weight at time of order
+  scaleUnit    String?   // Stored at order time for scalable products
 
-  quantity     Int
+  quantity     Float  // Float for scalable products
   price        Float
   subtotal     Float
 
@@ -669,7 +670,8 @@ model POSOrderItem {
   barcode      String?
   netWeight    String?
 
-  quantity     Int
+  scaleUnit    String?   // Stored at sale time for scalable products
+  quantity     Float  // Float for scalable products (e.g. 1.5 kg)
   unitPrice    Float
   subtotal     Float
   discountApplied Float  @default(0)

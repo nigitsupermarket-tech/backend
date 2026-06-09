@@ -164,7 +164,12 @@ export const updateOrderStatus = async (
       action: `update order status → ${status}`,
       entity: "order",
       entityId: id,
-      metadata: { orderNumber: order.orderNumber, previousStatus: order.status, newStatus: status, notes },
+      metadata: {
+        orderNumber: order.orderNumber,
+        previousStatus: order.status,
+        newStatus: status,
+        notes,
+      },
       req,
     });
 
@@ -337,20 +342,30 @@ export const createOrder = async (
         throw new NotFoundError(`Product ${item.productId} not found`);
       if (product.status !== "ACTIVE")
         throw new AppError(`${product.name} is not available`, 400);
+      // ── Stock check ────────────────────────────────────────────────────────
+      // For scalable products, stockQuantity and item.quantity are both in
+      // scale units (e.g. kg). For fixed products, both are whole integers.
       if (!product.allowBackorder && product.stockQuantity < item.quantity) {
-        throw new AppError(`Insufficient stock for ${product.name}`, 400);
+        const unit = product.isScalable ? product.scaleUnit || "unit" : "units";
+        throw new AppError(
+          `Insufficient stock for ${product.name} (available: ${product.stockQuantity} ${unit})`,
+          400,
+        );
       }
 
-      const itemSubtotal = product.price * item.quantity;
+      // ── Price ──────────────────────────────────────────────────────────────
+      // Scalable: price = pricePerUnit × quantity (quantity is float scale amount)
+      // Fixed:    price = product.price × quantity
+      const unitPrice =
+        product.isScalable && product.pricePerUnit
+          ? product.pricePerUnit
+          : product.price;
+      const itemSubtotal = unitPrice * item.quantity;
       subtotal += itemSubtotal;
 
-      // Shipping weight calculation:
-      // - Normal product: product.weight (kg per unit) × quantity ordered
-      // - Scalable product (kg/g/lb): product.weight = kg per 1 scale-unit
-      //   × quantity (which is the ordered amount in that unit, e.g. 1.5 kg)
-      //   = correct total kg for shipment
-      // - Scalable product (L/cup/piece/etc.): product.weight = kg per 1 unit
-      //   × quantity ordered = correct total kg
+      // Shipping weight:
+      // product.weight = kg per 1 unit/scale-unit
+      // × item.quantity = total kg for shipment
       totalWeight += (product.weight || 0) * item.quantity;
 
       categoryIds.push(product.categoryId);
@@ -361,8 +376,10 @@ export const createOrder = async (
         productName: product.name,
         productSku: product.sku,
         productImage: product.images[0] || null,
+        netWeight: product.netWeight || null,
+        scaleUnit: product.isScalable ? product.scaleUnit || null : null,
         quantity: item.quantity,
-        price: product.price,
+        price: unitPrice,
         subtotal: itemSubtotal,
       });
     }
@@ -511,9 +528,11 @@ export const createOrder = async (
     ).catch((err) => console.error("[email] Order confirmation failed:", err));
 
     // Notify admin notification emails (configured in Settings → Notifications)
-    prisma.siteSetting.findFirst()
+    prisma.siteSetting
+      .findFirst()
       .then((cfg) => {
-        const adminEmails: string[] = (cfg as any)?.adminNotificationEmails ?? [];
+        const adminEmails: string[] =
+          (cfg as any)?.adminNotificationEmails ?? [];
         if (adminEmails.length === 0) return;
         return sendAdminNewOrderEmail(
           adminEmails,
@@ -524,7 +543,9 @@ export const createOrder = async (
           order.items?.length ?? 0,
         );
       })
-      .catch((err) => console.error("[email] Admin order notification failed:", err));
+      .catch((err) =>
+        console.error("[email] Admin order notification failed:", err),
+      );
 
     logActivity({
       userId: (req as AuthRequest).user?.userId,

@@ -13,19 +13,15 @@ async function findOrCreateCart(
 ) {
   const where = userId ? { userId } : { sessionId };
 
-  // Try to find existing cart first
   let cart = await prisma.cart.findFirst({ where });
   if (cart) return cart;
 
-  // No cart found — try to create.
   try {
     cart = await prisma.cart.create({
       data: userId ? { userId } : { sessionId },
     });
     return cart;
   } catch (err: any) {
-    // P2002 = unique constraint violation: another concurrent request already
-    // created this cart. Retry the find — it must exist now.
     if (err?.code === "P2002" || err?.code === 11000) {
       const existing = await prisma.cart.findFirst({ where });
       if (existing) return existing;
@@ -64,6 +60,9 @@ export const getCart = async (
                 slug: true,
                 images: true,
                 price: true,
+                pricePerUnit: true,
+                isScalable: true,
+                scaleUnit: true,
                 stockQuantity: true,
                 status: true,
                 sku: true,
@@ -81,7 +80,10 @@ export const getCart = async (
       });
     }
 
+    // For scalable items, price stored in CartItem is pricePerUnit;
+    // subtotal = price * quantity (where quantity is the float amount, e.g. 1.5 kg)
     const subtotal = cart.items.reduce((s, i) => s + i.price * i.quantity, 0);
+    // Item count: for scalable, count fractional amounts; for fixed, whole units
     const itemCount = cart.items.reduce((s, i) => s + i.quantity, 0);
 
     res.status(200).json({
@@ -120,20 +122,30 @@ export const addToCart = async (
     if (!product) throw new NotFoundError("Product not found");
     if (product.status !== "ACTIVE")
       throw new AppError("This product is currently unavailable", 400);
+
+    // ── Stock check ──────────────────────────────────────────────────────────
+    // For scalable products: stockQuantity is in scale units (e.g. kg).
+    // quantity from request is also in scale units.
+    // For fixed products: both are whole integers.
     if (!product.allowBackorder && product.stockQuantity < quantity) {
       if (product.stockQuantity === 0) {
         throw new AppError(`${product.name} is out of stock`, 400);
       }
-      throw new AppError(
-        `Only ${product.stockQuantity} unit${product.stockQuantity === 1 ? "" : "s"} of ${product.name} available`,
-        400,
-      );
+      const unit = product.isScalable ? product.scaleUnit || "unit" : "unit";
+      const available = product.isScalable
+        ? `${product.stockQuantity} ${unit}`
+        : `${product.stockQuantity} unit${product.stockQuantity === 1 ? "" : "s"}`;
+      throw new AppError(`Only ${available} of ${product.name} available`, 400);
     }
 
-    // ✅ Race-safe find-or-create
+    // ── Price: use pricePerUnit for scalable, price for fixed ────────────────
+    const itemPrice =
+      product.isScalable && product.pricePerUnit
+        ? product.pricePerUnit
+        : product.price;
+
     const cart = await findOrCreateCart(userId, sessionId);
 
-    // Check if item already in cart
     const existingItem = await prisma.cartItem.findFirst({
       where: { cartId: cart.id, productId },
     });
@@ -142,6 +154,9 @@ export const addToCart = async (
       const newQty = existingItem.quantity + quantity;
       if (!product.allowBackorder && product.stockQuantity < newQty) {
         const available = product.stockQuantity - existingItem.quantity;
+        const unit = product.isScalable
+          ? product.scaleUnit || "unit"
+          : undefined;
         if (available <= 0) {
           throw new AppError(
             `You already have all available stock of ${product.name} in your cart`,
@@ -149,7 +164,9 @@ export const addToCart = async (
           );
         }
         throw new AppError(
-          `Only ${available} more unit${available === 1 ? "" : "s"} of ${product.name} can be added`,
+          unit
+            ? `Only ${available} ${unit} more of ${product.name} can be added`
+            : `Only ${available} more unit${available === 1 ? "" : "s"} of ${product.name} can be added`,
           400,
         );
       }
@@ -159,7 +176,7 @@ export const addToCart = async (
       });
     } else {
       await prisma.cartItem.create({
-        data: { cartId: cart.id, productId, quantity, price: product.price },
+        data: { cartId: cart.id, productId, quantity, price: itemPrice },
       });
     }
 
@@ -174,6 +191,9 @@ export const addToCart = async (
                 name: true,
                 images: true,
                 price: true,
+                pricePerUnit: true,
+                isScalable: true,
+                scaleUnit: true,
                 stockQuantity: true,
               },
             },
@@ -208,17 +228,31 @@ export const updateCartItem = async (
     const itemId = req.params.itemId as string;
     const { quantity } = req.body;
 
-    if (quantity < 1) throw new AppError("Quantity must be at least 1", 400);
-
     const item = await prisma.cartItem.findUnique({
       where: { id: itemId },
       include: { product: true },
     });
     if (!item) throw new NotFoundError("Cart item not found");
 
-    if (!item.product.allowBackorder && item.product.stockQuantity < quantity) {
+    // Minimum: for scalable products use minOrderQty, for fixed use 1
+    const minQty = item.product.isScalable
+      ? item.product.minOrderQty || item.product.scaleStep || 0.1
+      : 1;
+
+    if (quantity < minQty)
       throw new AppError(
-        `Only ${item.product.stockQuantity} item(s) available`,
+        `Minimum quantity is ${minQty}${item.product.isScalable ? ` ${item.product.scaleUnit || "unit"}` : ""}`,
+        400,
+      );
+
+    if (!item.product.allowBackorder && item.product.stockQuantity < quantity) {
+      const unit = item.product.isScalable
+        ? item.product.scaleUnit || "unit"
+        : undefined;
+      throw new AppError(
+        unit
+          ? `Only ${item.product.stockQuantity} ${unit} of ${item.product.name} available`
+          : `Only ${item.product.stockQuantity} item(s) available`,
         400,
       );
     }
@@ -269,8 +303,6 @@ export const clearCart = async (
 };
 
 // ── POST /api/v1/cart/merge ───────────────────────────────────────────────────
-// Called after login. Merges guest session cart into the user's cart,
-// then deletes the guest cart and clears the session cookie.
 export const mergeCart = async (
   req: AuthRequest,
   res: Response,
@@ -293,17 +325,14 @@ export const mergeCart = async (
     });
 
     if (!guestCart || guestCart.items.length === 0) {
-      // Clean up empty/missing guest cart cookie
       res.clearCookie("cartSession");
       return res
         .status(200)
         .json({ success: true, message: "No guest cart to merge" });
     }
 
-    // ✅ Race-safe find-or-create for user cart
     const userCart = await findOrCreateCart(userId, undefined);
 
-    // Merge items: add guest quantities on top of any existing user quantities
     for (const guestItem of guestCart.items) {
       const existing = await prisma.cartItem.findFirst({
         where: { cartId: userCart.id, productId: guestItem.productId },
@@ -326,7 +355,6 @@ export const mergeCart = async (
       }
     }
 
-    // Delete guest cart and clear cookie
     await prisma.cart.delete({ where: { id: guestCart.id } });
     res.clearCookie("cartSession");
 

@@ -61,8 +61,12 @@ export const createPOSOrder = async (
         throw new AppError(`${product.name} is not currently available`, 400);
       }
       if (product.trackInventory && product.stockQuantity < item.quantity) {
+        // For scalable products, stockQuantity is in scale units (e.g. kg)
+        const unit = product.isScalable
+          ? ` ${product.scaleUnit || "unit"}`
+          : "";
         throw new AppError(
-          `Insufficient stock for ${product.name} (available: ${product.stockQuantity})`,
+          `Insufficient stock for ${product.name} (available: ${product.stockQuantity}${unit})`,
           400,
         );
       }
@@ -99,6 +103,7 @@ export const createPOSOrder = async (
               productSku: item.productSku,
               barcode: item.barcode ?? null,
               netWeight: item.netWeight ?? null,
+              scaleUnit: item.scaleUnit ?? null,
               quantity: item.quantity,
               unitPrice: item.unitPrice,
               subtotal: item.subtotal,
@@ -147,7 +152,12 @@ export const createPOSOrder = async (
       action: "create POS sale",
       entity: "order",
       entityId: posOrder.id,
-      metadata: { posOrderNumber, total: posOrder.total, paymentMethod: posOrder.paymentMethod, customerName: posOrder.customerName || "Walk-In" },
+      metadata: {
+        posOrderNumber,
+        total: posOrder.total,
+        paymentMethod: posOrder.paymentMethod,
+        customerName: posOrder.customerName || "Walk-In",
+      },
       req,
     });
 
