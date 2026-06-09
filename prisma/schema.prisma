@@ -236,6 +236,7 @@ enum ProductStatus {
   DISCONTINUED
 }
 
+
 model Product {
   id                String        @id @default(auto()) @map("_id") @db.ObjectId
   name              String
@@ -298,6 +299,15 @@ model Product {
   length            Float?        // in cm
   width             Float?        // in cm
   height            Float?        // in cm
+
+  // Scalable Products (sold by weight/volume)
+isScalable      Boolean   @default(false)
+scaleUnit       String?   // "kg", "g", "L", "cup", "custom", etc.
+pricePerUnit    Float?    // price for 1 unit
+minOrderQty     Float?    // e.g. 0.1
+maxOrderQty     Float?    // e.g. 10n
+scaleStep       Float?    // e.g. 0.1
+scalePresets    Float[]   @default([])
 
   // SEO
   metaTitle         String?

@@ -343,6 +343,14 @@ export const createOrder = async (
 
       const itemSubtotal = product.price * item.quantity;
       subtotal += itemSubtotal;
+
+      // Shipping weight calculation:
+      // - Normal product: product.weight (kg per unit) × quantity ordered
+      // - Scalable product (kg/g/lb): product.weight = kg per 1 scale-unit
+      //   × quantity (which is the ordered amount in that unit, e.g. 1.5 kg)
+      //   = correct total kg for shipment
+      // - Scalable product (L/cup/piece/etc.): product.weight = kg per 1 unit
+      //   × quantity ordered = correct total kg
       totalWeight += (product.weight || 0) * item.quantity;
 
       categoryIds.push(product.categoryId);
