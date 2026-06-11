@@ -273,11 +273,7 @@ export const getPOSOrder = async (
 };
 
 // ── PUT /api/v1/pos/orders/:id/void ──────────────────────────────────────────
-// FIX 1: cast id to string
-// FIX 2: don't use `include: { items: true }` on the outer findUnique and then
-//         access order.items inside $transaction — TypeScript loses the include
-//         type inside the callback. Instead fetch items separately inside tx
-//         using pOSOrderItem.findMany, which gives a fully-typed result.
+
 export const voidPOSOrder = async (
   req: AuthRequest,
   res: Response,
@@ -290,9 +286,14 @@ export const voidPOSOrder = async (
     // Fetch the order (no include needed here — we get items inside tx below)
     const order = await prisma.pOSOrder.findUnique({ where: { id } });
     if (!order) throw new NotFoundError("POS order not found");
-    if (order.status !== "COMPLETED") {
-      throw new AppError("Only completed orders can be voided", 400);
+    if (order.status === "VOIDED") {
+      throw new AppError("Order is already voided", 400);
     }
+    if (order.status === "REFUNDED") {
+      throw new AppError("Cannot void a refunded order", 400);
+    }
+    // Only COMPLETED orders have stock deducted, so only restore stock for those
+    const restoreStock = order.status === "COMPLETED";
 
     await prisma.$transaction(async (tx) => {
       // 1. Mark voided
@@ -305,36 +306,38 @@ export const voidPOSOrder = async (
         },
       });
 
-      // 2. ✅ Fix line 296: fetch items via pOSOrderItem — fully typed, no
-      //    "Property 'items' does not exist" error
+      // 2. Fetch order items
       const orderItems = await tx.pOSOrderItem.findMany({
         where: { posOrderId: id },
       });
 
-      // 3. Restore stock for each item
-      for (const item of orderItems) {
-        const product = await tx.product.findUnique({
-          where: { id: item.productId },
-        });
-        if (!product) continue;
-        await tx.product.update({
-          where: { id: item.productId },
-          data: {
-            stockQuantity: { increment: item.quantity },
-            salesCount: { decrement: item.quantity },
-          },
-        });
-        await tx.inventoryLog.create({
-          data: {
-            productId: item.productId,
-            type: "RETURN",
-            quantity: item.quantity,
-            previousQty: product.stockQuantity,
-            newQty: product.stockQuantity + item.quantity,
-            reason: `POS void: ${reason || "no reason"}`,
-            reference: order.posOrderNumber,
-          },
-        });
+      // 3. Restore stock — only for COMPLETED orders (hold/suspended orders
+      //    never had stock deducted, so no restoration needed)
+      if (restoreStock) {
+        for (const item of orderItems) {
+          const product = await tx.product.findUnique({
+            where: { id: item.productId },
+          });
+          if (!product) continue;
+          await tx.product.update({
+            where: { id: item.productId },
+            data: {
+              stockQuantity: { increment: item.quantity },
+              salesCount: { decrement: item.quantity },
+            },
+          });
+          await tx.inventoryLog.create({
+            data: {
+              productId: item.productId,
+              type: "RETURN",
+              quantity: item.quantity,
+              previousQty: product.stockQuantity,
+              newQty: product.stockQuantity + item.quantity,
+              reason: `POS void: ${reason || "no reason"}`,
+              reference: order.posOrderNumber,
+            },
+          });
+        }
       }
     });
 
@@ -635,6 +638,246 @@ export const getPOSSessions = async (
           totalPages: Math.ceil(total / Number(limit)),
         },
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── POST /api/v1/pos/orders/:id/suspend ──────────────────────────────────────
+// Pauses an OPEN transaction so the cashier can serve another customer.
+// The cart items are preserved in the order; stock is NOT yet deducted.
+export const suspendPOSOrder = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (!req.user) throw new AppError("Authentication required", 401);
+    const id = req.params.id as string;
+    const { label } = req.body; // optional cashier note, e.g. "Customer checking wallet"
+
+    const order = await prisma.pOSOrder.findUnique({ where: { id } });
+    if (!order) throw new NotFoundError("POS order not found");
+    if (order.status !== "OPEN") {
+      throw new AppError(
+        `Cannot suspend an order with status "${order.status}". Only OPEN orders can be suspended.`,
+        400,
+      );
+    }
+
+    const updated = await prisma.pOSOrder.update({
+      where: { id },
+      data: {
+        status: "SUSPENDED",
+        suspendedAt: new Date(),
+        suspendLabel: label ?? null,
+      },
+      include: { items: true },
+    });
+
+    logActivity({
+      userId: req.user.userId,
+      action: "suspend POS order",
+      entity: "order",
+      entityId: id,
+      metadata: {
+        posOrderNumber: updated.posOrderNumber,
+        label: label ?? null,
+        itemCount: updated.items.length,
+        total: updated.total,
+      },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Order suspended. You can resume it at any time.",
+      data: { order: updated },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── GET /api/v1/pos/orders/suspended ─────────────────────────────────────────
+// Returns all currently-suspended orders for the active session / staff member.
+export const getSuspendedOrders = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (!req.user) throw new AppError("Authentication required", 401);
+
+    const orders = await prisma.pOSOrder.findMany({
+      where: {
+        status: "SUSPENDED",
+        processedById: req.user.userId, // only show the cashier their own holds
+      },
+      orderBy: { suspendedAt: "asc" }, // oldest first — FIFO
+      include: { items: true },
+    });
+
+    res.status(200).json({ success: true, data: { orders } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── PUT /api/v1/pos/orders/:id/resume ────────────────────────────────────────
+// Moves a SUSPENDED order back to OPEN so the cashier can complete it.
+export const resumePOSOrder = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (!req.user) throw new AppError("Authentication required", 401);
+    const id = req.params.id as string;
+
+    const order = await prisma.pOSOrder.findUnique({
+      where: { id },
+      include: { items: true },
+    });
+    if (!order) throw new NotFoundError("POS order not found");
+    if (order.status !== "SUSPENDED") {
+      throw new AppError(
+        `Cannot resume an order with status "${order.status}". Only SUSPENDED orders can be resumed.`,
+        400,
+      );
+    }
+
+    // Re-validate stock before resuming (items may have sold out while suspended)
+    for (const item of order.items) {
+      const product = await prisma.product.findUnique({
+        where: { id: item.productId },
+      });
+      if (!product) continue;
+      if (product.trackInventory && product.stockQuantity < item.quantity) {
+        const unit = product.isScalable
+          ? ` ${product.scaleUnit || "unit"}`
+          : "";
+        throw new AppError(
+          `Stock changed while order was suspended — ${product.name} now only has ${product.stockQuantity}${unit} available (cart has ${item.quantity}${unit}).`,
+          400,
+        );
+      }
+    }
+
+    const updated = await prisma.pOSOrder.update({
+      where: { id },
+      data: {
+        status: "OPEN",
+        suspendedAt: null,
+        suspendLabel: null,
+      },
+      include: { items: true },
+    });
+
+    logActivity({
+      userId: req.user.userId,
+      action: "resume POS order",
+      entity: "order",
+      entityId: id,
+      metadata: {
+        posOrderNumber: updated.posOrderNumber,
+        itemCount: updated.items.length,
+        total: updated.total,
+      },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Order resumed.",
+      data: { order: updated },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── POST /api/v1/pos/orders/hold ─────────────────────────────────────────────
+// Creates an order directly in SUSPENDED status without touching stock.
+// Used by the frontend "Hold Transaction" button.
+export const holdNewPOSOrder = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (!req.user) throw new AppError("Authentication required", 401);
+    const staffId = req.user.userId;
+
+    const {
+      items,
+      subtotal,
+      discountAmount,
+      discountCode,
+      total,
+      customerName,
+      customerPhone,
+      label,
+    } = req.body;
+
+    if (!items || items.length === 0) {
+      throw new AppError("Order must have at least one item", 400);
+    }
+
+    const posOrderNumber = generatePOSOrderNumber();
+
+    const posOrder = await prisma.pOSOrder.create({
+      data: {
+        posOrderNumber,
+        processedById: staffId,
+        status: "SUSPENDED",
+        subtotal,
+        discountAmount: discountAmount || 0,
+        discountCode: discountCode || null,
+        // paymentMethod is unknown yet — use a placeholder
+        paymentMethod: "CASH",
+        total,
+        customerName: customerName ?? null,
+        customerPhone: customerPhone ?? null,
+        suspendedAt: new Date(),
+        suspendLabel: label ?? null,
+        items: {
+          create: items.map((item: any) => ({
+            productId: item.productId,
+            productName: item.productName,
+            productSku: item.productSku,
+            barcode: item.barcode ?? null,
+            netWeight: item.netWeight ?? null,
+            scaleUnit: item.scaleUnit ?? null,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice,
+            subtotal: item.subtotal,
+            discountApplied: item.discountApplied ?? 0,
+          })),
+        },
+      },
+      include: { items: true },
+    });
+
+    logActivity({
+      userId: req.user.userId,
+      action: "hold POS order",
+      entity: "order",
+      entityId: posOrder.id,
+      metadata: {
+        posOrderNumber,
+        label: label ?? null,
+        total: posOrder.total,
+        itemCount: posOrder.items.length,
+      },
+      req,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Transaction held successfully.",
+      data: { order: posOrder },
     });
   } catch (error) {
     next(error);
