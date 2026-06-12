@@ -12,9 +12,12 @@ const JWT_SECRET: Secret =
 const JWT_REFRESH_SECRET: Secret =
   (process.env.JWT_REFRESH_SECRET as Secret) ?? "fallback-refresh-secret";
 
-// Access token: 15 minutes (short-lived, sent in every request)
+// Access token: 18 hours (long-lived enough to cover a full shift on a
+// busy POS without forcing re-logins; refresh still rotates it daily).
+// Previously 15m — that meant a silent-refresh every 15 minutes, and any
+// network hiccup during that refresh would log the cashier/admin out.
 const JWT_EXPIRES_IN: SignOptions["expiresIn"] =
-  (process.env.JWT_EXPIRES_IN as SignOptions["expiresIn"]) ?? "15m";
+  (process.env.JWT_EXPIRES_IN as SignOptions["expiresIn"]) ?? "18h";
 
 // ✅ SESSION PERSISTENCE: Refresh token extended to 30 days (was 7d).
 // Combined with rolling refresh (each refresh call issues a new 30d token),

@@ -622,10 +622,35 @@ export const getPOSSessions = async (
       });
     }
 
-    const sessions = rawSessions.map((s) => ({
-      ...s,
-      staff: staffMap[s.staffId] ?? null,
-    }));
+    const sessions = await Promise.all(
+      rawSessions.map(async (s) => {
+        // CLOSED sessions already have their final totals persisted by
+        // closePOSSession — use those directly.
+        if (s.status === "CLOSED") {
+          return { ...s, staff: staffMap[s.staffId] ?? null };
+        }
+
+        // OPEN sessions never had totals written, so compute them live —
+        // same query shape as closePOSSession — so the admin can see
+        // real-time progress (matches the Staff POS Performance dashboard).
+        const liveStats = await prisma.pOSOrder.aggregate({
+          where: {
+            processedById: s.staffId,
+            status: "COMPLETED",
+            createdAt: { gte: s.openedAt },
+          },
+          _sum: { total: true },
+          _count: { id: true },
+        });
+
+        return {
+          ...s,
+          totalOrders: liveStats._count.id,
+          totalSales: liveStats._sum.total || 0,
+          staff: staffMap[s.staffId] ?? null,
+        };
+      }),
+    );
 
     res.status(200).json({
       success: true,

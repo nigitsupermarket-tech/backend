@@ -21,13 +21,14 @@ import { AuthRequest } from "../middlewares/auth.middleware";
 
 const IS_PROD = process.env.NODE_ENV === "production";
 
-// ✅ SESSION PERSISTENCE: Access token cookie — 15 minutes (short window; the
-// refresh interceptor on the frontend will silently replace it before it's noticed)
+// ✅ SESSION PERSISTENCE: Access token cookie — 12 hours, matching
+// JWT_EXPIRES_IN. Long enough to cover a full shift on a busy POS without
+// forcing frequent re-logins.
 const ACCESS_COOKIE_OPTIONS = {
   httpOnly: true,
   secure: IS_PROD,
   sameSite: "strict" as const,
-  maxAge: 15 * 60 * 1000,
+  maxAge: 12 * 60 * 60 * 1000,
 };
 
 // ✅ SESSION PERSISTENCE: Refresh token cookie — 30 days, rolling.
@@ -226,7 +227,12 @@ export const logout = async (
 
     clearAuthCookies(res);
 
-    logActivity({ userId: req.user.userId, action: "logout", entity: "session", req });
+    logActivity({
+      userId: req.user.userId,
+      action: "logout",
+      entity: "session",
+      req,
+    });
 
     res.status(200).json({ success: true, message: "Logout successful" });
   } catch (error) {
@@ -653,12 +659,10 @@ export const updatePassword = async (
 
     clearAuthCookies(res);
 
-    res
-      .status(200)
-      .json({
-        success: true,
-        message: "Password updated successfully. Please log in again.",
-      });
+    res.status(200).json({
+      success: true,
+      message: "Password updated successfully. Please log in again.",
+    });
   } catch (error) {
     next(error);
   }
