@@ -590,73 +590,108 @@ export const getPOSSessions = async (
   try {
     const { page = "1", limit = "20" } = req.query;
     const skip = (Number(page) - 1) * Number(limit);
-
-    // ── Role-based scoping ─────────────────────────────────────────────────
-    // ADMIN          → every session, any role
-    // MANAGER        → sessions for MANAGER/STAFF/SALES only (never ADMIN)
-    // STAFF / SALES  → only their own session(s) — covers the POS terminal's
-    //                  "?limit=1" call used to check for an open session
     const role = req.user?.role;
-    const where: any = {};
 
-    if (role === "ADMIN") {
-      // no filter — everything
-    } else if (role === "MANAGER") {
-      const visibleStaff = await prisma.user.findMany({
-        where: { role: { in: ["MANAGER", "STAFF", "SALES"] as any } },
-        select: { id: true },
-      });
-      where.staffId = { in: visibleStaff.map((u) => u.id) };
-    } else {
-      where.staffId = req.user?.userId;
-    }
+    // ── Helper: build the enriched session object for a given user ─────────
+    // Returns the user's most relevant POSSession (preferring an OPEN one,
+    // else their most recently CLOSED one), enriched with live stats. If the
+    // user has never opened a session, returns a "NO_SESSION" placeholder so
+    // they still appear in the roster.
+    const buildSessionForUser = async (u: {
+      id: string;
+      name: string;
+      email: string;
+      role: string;
+    }) => {
+      const session =
+        (await prisma.pOSSession.findFirst({
+          where: { staffId: u.id, status: "OPEN" },
+        })) ||
+        (await prisma.pOSSession.findFirst({
+          where: { staffId: u.id, status: "CLOSED" },
+          orderBy: { openedAt: "desc" },
+        }));
 
-    const [rawSessions, total] = await Promise.all([
-      prisma.pOSSession.findMany({
-        where,
-        skip,
-        take: Number(limit),
-        orderBy: { openedAt: "desc" },
-      }),
-      prisma.pOSSession.count({ where }),
-    ]);
+      const staff = { name: u.name, email: u.email, role: u.role };
 
-    // ── Manual staff join ──────────────────────────────────────────────────────
-    // POSSession has no Prisma relation to User (just a plain staffId string),
-    // so we fetch the relevant User records in one extra query and stitch them in.
-    const uniqueStaffIds = [
-      ...new Set(rawSessions.map((s) => s.staffId).filter(Boolean)),
-    ];
+      if (!session) {
+        return {
+          id: `no-session-${u.id}`,
+          staffId: u.id,
+          openedAt: null,
+          closedAt: null,
+          status: "NO_SESSION",
+          openingFloat: 0,
+          closingFloat: undefined,
+          expectedCash: undefined,
+          variance: undefined,
+          totalSales: 0,
+          totalOrders: 0,
+          cashSales: 0,
+          cardSales: 0,
+          transferSales: 0,
+          notes: undefined,
+          recentOrders: [],
+          staff,
+        };
+      }
 
-    const staffMap: Record<
-      string,
-      { name: string; email: string; role: string }
-    > = {};
-
-    if (uniqueStaffIds.length > 0) {
-      const users = await prisma.user.findMany({
-        where: { id: { in: uniqueStaffIds } },
-        select: { id: true, name: true, email: true, role: true },
-      });
-      users.forEach((u) => {
-        staffMap[u.id] = { name: u.name, email: u.email, role: u.role };
-      });
-    }
-
-    const sessions = await Promise.all(
-      rawSessions.map(async (s) => {
-        // CLOSED sessions already have their final totals persisted by
-        // closePOSSession — use those directly.
-        if (s.status === "CLOSED") {
-          const recentOrders = await prisma.pOSOrder.findMany({
-            where: {
-              processedById: s.staffId,
-              status: "COMPLETED",
-              createdAt: {
-                gte: s.openedAt,
-                ...(s.closedAt ? { lte: s.closedAt } : {}),
-              },
+      // CLOSED sessions already have their final totals persisted by
+      // closePOSSession — use those, plus a recent-transactions list.
+      if (session.status === "CLOSED") {
+        const recentOrders = await prisma.pOSOrder.findMany({
+          where: {
+            processedById: session.staffId,
+            status: "COMPLETED",
+            createdAt: {
+              gte: session.openedAt,
+              ...(session.closedAt ? { lte: session.closedAt } : {}),
             },
+          },
+          orderBy: { createdAt: "desc" },
+          take: 10,
+          select: {
+            id: true,
+            posOrderNumber: true,
+            receiptNumber: true,
+            total: true,
+            paymentMethod: true,
+            customerName: true,
+            createdAt: true,
+          },
+        });
+        return { ...session, recentOrders, staff };
+      }
+
+      // OPEN session — compute live totals, payment-method breakdown, and a
+      // recent-transactions list so the expanded panel shows real data.
+      const baseWhere = {
+        processedById: session.staffId,
+        status: "COMPLETED" as const,
+        createdAt: { gte: session.openedAt },
+      };
+
+      const [liveStats, cashStats, cardStats, transferStats, recentOrders] =
+        await Promise.all([
+          prisma.pOSOrder.aggregate({
+            where: baseWhere,
+            _sum: { total: true },
+            _count: { id: true },
+          }),
+          prisma.pOSOrder.aggregate({
+            where: { ...baseWhere, paymentMethod: "CASH" },
+            _sum: { total: true },
+          }),
+          prisma.pOSOrder.aggregate({
+            where: { ...baseWhere, paymentMethod: "CARD" },
+            _sum: { total: true },
+          }),
+          prisma.pOSOrder.aggregate({
+            where: { ...baseWhere, paymentMethod: "TRANSFER" },
+            _sum: { total: true },
+          }),
+          prisma.pOSOrder.findMany({
+            where: baseWhere,
             orderBy: { createdAt: "desc" },
             take: 10,
             select: {
@@ -668,69 +703,64 @@ export const getPOSSessions = async (
               customerName: true,
               createdAt: true,
             },
-          });
-          return { ...s, recentOrders, staff: staffMap[s.staffId] ?? null };
-        }
+          }),
+        ]);
 
-        // OPEN sessions never had totals written, so compute them live —
-        // same query shape as closePOSSession — so the admin can see
-        // real-time progress (matches the Staff POS Performance dashboard).
-        const baseWhere = {
-          processedById: s.staffId,
-          status: "COMPLETED" as const,
-          createdAt: { gte: s.openedAt },
-        };
+      return {
+        ...session,
+        totalOrders: liveStats._count.id,
+        totalSales: liveStats._sum.total || 0,
+        cashSales: cashStats._sum.total || 0,
+        cardSales: cardStats._sum.total || 0,
+        transferSales: transferStats._sum.total || 0,
+        recentOrders,
+        staff,
+      };
+    };
 
-        const [liveStats, cashStats, cardStats, transferStats, recentOrders] =
-          await Promise.all([
-            prisma.pOSOrder.aggregate({
-              where: baseWhere,
-              _sum: { total: true },
-              _count: { id: true },
-            }),
-            prisma.pOSOrder.aggregate({
-              where: { ...baseWhere, paymentMethod: "CASH" },
-              _sum: { total: true },
-            }),
-            prisma.pOSOrder.aggregate({
-              where: { ...baseWhere, paymentMethod: "CARD" },
-              _sum: { total: true },
-            }),
-            prisma.pOSOrder.aggregate({
-              where: { ...baseWhere, paymentMethod: "TRANSFER" },
-              _sum: { total: true },
-            }),
-            // A handful of recent transactions for this open session, so the
-            // expanded panel shows real "POS transaction details" instead of
-            // just blank aggregate cards.
-            prisma.pOSOrder.findMany({
-              where: baseWhere,
-              orderBy: { createdAt: "desc" },
-              take: 10,
-              select: {
-                id: true,
-                posOrderNumber: true,
-                receiptNumber: true,
-                total: true,
-                paymentMethod: true,
-                customerName: true,
-                createdAt: true,
-              },
-            }),
-          ]);
+    // ── Role-based roster ────────────────────────────────────────────────
+    // ADMIN          → every user with role ADMIN/MANAGER/STAFF/SALES (i.e.
+    //                  the full staff roster, including admins).
+    // MANAGER        → every user EXCEPT admins (MANAGER/STAFF/SALES).
+    // STAFF / SALES  → just themselves — covers the POS terminal's
+    //                  "?limit=1" call used to check for an open session.
+    let visibleRoles: string[];
+    if (role === "ADMIN") {
+      visibleRoles = ["ADMIN", "MANAGER", "STAFF", "SALES"];
+    } else if (role === "MANAGER") {
+      visibleRoles = ["MANAGER", "STAFF", "SALES"];
+    } else {
+      visibleRoles = [];
+    }
 
-        return {
-          ...s,
-          totalOrders: liveStats._count.id,
-          totalSales: liveStats._sum.total || 0,
-          cashSales: cashStats._sum.total || 0,
-          cardSales: cardStats._sum.total || 0,
-          transferSales: transferStats._sum.total || 0,
-          recentOrders,
-          staff: staffMap[s.staffId] ?? null,
-        };
-      }),
-    );
+    let total: number;
+    let sessions: any[];
+
+    if (visibleRoles.length > 0) {
+      const [users, userCount] = await Promise.all([
+        prisma.user.findMany({
+          where: { role: { in: visibleRoles as any } },
+          select: { id: true, name: true, email: true, role: true },
+          orderBy: { name: "asc" },
+          skip,
+          take: Number(limit),
+        }),
+        prisma.user.count({ where: { role: { in: visibleRoles as any } } }),
+      ]);
+
+      total = userCount;
+      sessions = await Promise.all(users.map(buildSessionForUser));
+    } else {
+      // Regular STAFF/SALES — only their own session, if any.
+      const userId = req.user?.userId as string;
+      const me = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, name: true, email: true, role: true },
+      });
+      const own = me ? [await buildSessionForUser(me)] : [];
+      total = own.length;
+      sessions = own;
+    }
 
     res.status(200).json({
       success: true,
