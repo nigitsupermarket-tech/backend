@@ -591,13 +591,34 @@ export const getPOSSessions = async (
     const { page = "1", limit = "20" } = req.query;
     const skip = (Number(page) - 1) * Number(limit);
 
+    // ── Role-based scoping ─────────────────────────────────────────────────
+    // ADMIN          → every session, any role
+    // MANAGER        → sessions for MANAGER/STAFF/SALES only (never ADMIN)
+    // STAFF / SALES  → only their own session(s) — covers the POS terminal's
+    //                  "?limit=1" call used to check for an open session
+    const role = req.user?.role;
+    const where: any = {};
+
+    if (role === "ADMIN") {
+      // no filter — everything
+    } else if (role === "MANAGER") {
+      const visibleStaff = await prisma.user.findMany({
+        where: { role: { in: ["MANAGER", "STAFF", "SALES"] as any } },
+        select: { id: true },
+      });
+      where.staffId = { in: visibleStaff.map((u) => u.id) };
+    } else {
+      where.staffId = req.user?.userId;
+    }
+
     const [rawSessions, total] = await Promise.all([
       prisma.pOSSession.findMany({
+        where,
         skip,
         take: Number(limit),
         orderBy: { openedAt: "desc" },
       }),
-      prisma.pOSSession.count(),
+      prisma.pOSSession.count({ where }),
     ]);
 
     // ── Manual staff join ──────────────────────────────────────────────────────

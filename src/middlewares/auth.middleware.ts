@@ -15,7 +15,11 @@ export interface AuthRequest extends Request {
   user?: TokenPayload;
 }
 
-export const protect = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
+export const protect = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
   try {
     let token: string | undefined;
     if (req.headers.authorization?.startsWith("Bearer")) {
@@ -37,23 +41,35 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
 export const restrictTo = (...roles: string[]) => {
   return (req: AuthRequest, res: Response, next: NextFunction): void => {
     if (!req.user) return next(new AppError("Not authorized", 401));
-    if (!roles.includes(req.user.role)) return next(new AppError("You do not have permission", 403));
+    if (!roles.includes(req.user.role))
+      return next(new AppError("You do not have permission", 403));
     next();
   };
 };
 
 export const adminOnly = restrictTo("ADMIN");
 
-// STAFF, ADMIN, and SALES can all access sales-related routes
-export const staffOrAdmin = restrictTo("ADMIN", "STAFF", "SALES");
+// STAFF, ADMIN, SALES, and MANAGER can all access sales-related routes.
+// MANAGER has all STAFF capabilities (plus extra access granted via
+// adminOrManager below for POS sessions / user management).
+export const staffOrAdmin = restrictTo("ADMIN", "STAFF", "SALES", "MANAGER");
 
 // Admin + Sales manager (not regular staff)
 export const salesOrAdmin = restrictTo("ADMIN", "SALES");
 
-export const optionalAuth = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
+// Admin + Manager — used for POS session oversight and user-management routes
+// that MANAGER is allowed into (but regular STAFF/SALES are not).
+export const adminOrManager = restrictTo("ADMIN", "MANAGER");
+
+export const optionalAuth = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
   try {
     let token: string | undefined;
-    if (req.headers.authorization?.startsWith("Bearer")) token = req.headers.authorization.split(" ")[1];
+    if (req.headers.authorization?.startsWith("Bearer"))
+      token = req.headers.authorization.split(" ")[1];
     else if (req.cookies?.accessToken) token = req.cookies.accessToken;
     if (token) req.user = verifyAccessToken(token) as TokenPayload;
     next();

@@ -20,6 +20,7 @@ enum UserRole {
   STAFF
   ADMIN
   SALES
+  MANAGER
 }
 
 model User {

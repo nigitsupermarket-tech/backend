@@ -36,6 +36,10 @@ router.get("/stats", getPOSStats);
 
 // Sessions
 router.post("/sessions", openPOSSession);
+// Open to all staffOrAdmin (the POS terminal calls this with ?limit=1 to
+// check the cashier's own session). Role-based scoping of the FULL list
+// (ADMIN sees all, MANAGER sees MANAGER/STAFF/SALES, regular STAFF/SALES
+// only see their own) happens inside getPOSSessions.
 router.get("/sessions", getPOSSessions);
 router.put("/sessions/:id/close", closePOSSession);
 router.post("/sessions/:id/close", closePOSSession); // backwards compat

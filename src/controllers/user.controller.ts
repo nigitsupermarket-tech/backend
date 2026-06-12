@@ -22,6 +22,17 @@ export const getUsers = async (
       ];
     }
 
+    // MANAGER can see/manage everyone except ADMIN accounts — they should
+    // never see admin users in user management.
+    if (req.user?.role === "MANAGER") {
+      if (where.role === "ADMIN") {
+        // Explicitly asked for admins — return empty rather than leaking them
+        where.role = "__NONE__";
+      } else if (!where.role) {
+        where.role = { not: "ADMIN" };
+      }
+    }
+
     const [users, total] = await Promise.all([
       prisma.user.findMany({
         where,
@@ -71,8 +82,10 @@ export const getUser = async (
   try {
     const id = req.params.id as string;
 
-    const isAdmin = ["ADMIN", "STAFF"].includes(req.user?.role || "");
-    if (!isAdmin && req.user?.userId !== id)
+    const isStaffSide = ["ADMIN", "STAFF", "SALES", "MANAGER"].includes(
+      req.user?.role || "",
+    );
+    if (!isStaffSide && req.user?.userId !== id)
       throw new AppError("Not authorized", 403);
 
     const user = await prisma.user.findUnique({
@@ -105,6 +118,9 @@ export const getUser = async (
       },
     });
     if (!user) throw new NotFoundError("User not found");
+    if (req.user?.role === "MANAGER" && user.role === "ADMIN") {
+      throw new AppError("Not authorized", 403);
+    }
 
     res.status(200).json({ success: true, data: { user } });
   } catch (error) {
@@ -119,6 +135,11 @@ export const createUser = async (
 ) => {
   try {
     const { name, email, phone, password, role } = req.body;
+
+    // MANAGER can create staff/sales/manager accounts, but never ADMIN.
+    if (req.user?.role === "MANAGER" && role === "ADMIN") {
+      throw new AppError("Managers cannot create admin accounts", 403);
+    }
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing)
@@ -173,16 +194,38 @@ export const updateUser = async (
     const id = req.params.id as string;
 
     const isAdmin = req.user?.role === "ADMIN";
+    const isManager = req.user?.role === "MANAGER";
     const isSelf = req.user?.userId === id;
-    if (!isAdmin && !isSelf) throw new AppError("Not authorized", 403);
+    if (!isAdmin && !isManager && !isSelf)
+      throw new AppError("Not authorized", 403);
 
     const { name, phone, image, role, customerSegment } = req.body;
     const updates: any = {};
     if (name) updates.name = name;
     if (phone) updates.phone = phone;
     if (image) updates.image = image;
-    if (role && isAdmin) updates.role = role;
-    if (customerSegment && isAdmin) updates.customerSegment = customerSegment;
+
+    // ── Role assignment ──────────────────────────────────────────────────
+    // ADMIN: can assign any role to anyone.
+    // MANAGER: can assign any role EXCEPT "ADMIN", and cannot modify a user
+    //          who currently holds the ADMIN role (no demoting admins).
+    if (role && (isAdmin || isManager)) {
+      if (isManager) {
+        if (role === "ADMIN") {
+          throw new AppError("Managers cannot assign the ADMIN role", 403);
+        }
+        const target = await prisma.user.findUnique({
+          where: { id },
+          select: { role: true },
+        });
+        if (target?.role === "ADMIN") {
+          throw new AppError("Managers cannot modify an admin account", 403);
+        }
+      }
+      updates.role = role;
+    }
+    if (customerSegment && (isAdmin || isManager))
+      updates.customerSegment = customerSegment;
 
     const user = await prisma.user.update({
       where: { id },
