@@ -648,26 +648,85 @@ export const getPOSSessions = async (
         // CLOSED sessions already have their final totals persisted by
         // closePOSSession — use those directly.
         if (s.status === "CLOSED") {
-          return { ...s, staff: staffMap[s.staffId] ?? null };
+          const recentOrders = await prisma.pOSOrder.findMany({
+            where: {
+              processedById: s.staffId,
+              status: "COMPLETED",
+              createdAt: {
+                gte: s.openedAt,
+                ...(s.closedAt ? { lte: s.closedAt } : {}),
+              },
+            },
+            orderBy: { createdAt: "desc" },
+            take: 10,
+            select: {
+              id: true,
+              posOrderNumber: true,
+              receiptNumber: true,
+              total: true,
+              paymentMethod: true,
+              customerName: true,
+              createdAt: true,
+            },
+          });
+          return { ...s, recentOrders, staff: staffMap[s.staffId] ?? null };
         }
 
         // OPEN sessions never had totals written, so compute them live —
         // same query shape as closePOSSession — so the admin can see
         // real-time progress (matches the Staff POS Performance dashboard).
-        const liveStats = await prisma.pOSOrder.aggregate({
-          where: {
-            processedById: s.staffId,
-            status: "COMPLETED",
-            createdAt: { gte: s.openedAt },
-          },
-          _sum: { total: true },
-          _count: { id: true },
-        });
+        const baseWhere = {
+          processedById: s.staffId,
+          status: "COMPLETED" as const,
+          createdAt: { gte: s.openedAt },
+        };
+
+        const [liveStats, cashStats, cardStats, transferStats, recentOrders] =
+          await Promise.all([
+            prisma.pOSOrder.aggregate({
+              where: baseWhere,
+              _sum: { total: true },
+              _count: { id: true },
+            }),
+            prisma.pOSOrder.aggregate({
+              where: { ...baseWhere, paymentMethod: "CASH" },
+              _sum: { total: true },
+            }),
+            prisma.pOSOrder.aggregate({
+              where: { ...baseWhere, paymentMethod: "CARD" },
+              _sum: { total: true },
+            }),
+            prisma.pOSOrder.aggregate({
+              where: { ...baseWhere, paymentMethod: "TRANSFER" },
+              _sum: { total: true },
+            }),
+            // A handful of recent transactions for this open session, so the
+            // expanded panel shows real "POS transaction details" instead of
+            // just blank aggregate cards.
+            prisma.pOSOrder.findMany({
+              where: baseWhere,
+              orderBy: { createdAt: "desc" },
+              take: 10,
+              select: {
+                id: true,
+                posOrderNumber: true,
+                receiptNumber: true,
+                total: true,
+                paymentMethod: true,
+                customerName: true,
+                createdAt: true,
+              },
+            }),
+          ]);
 
         return {
           ...s,
           totalOrders: liveStats._count.id,
           totalSales: liveStats._sum.total || 0,
+          cashSales: cashStats._sum.total || 0,
+          cardSales: cardStats._sum.total || 0,
+          transferSales: transferStats._sum.total || 0,
+          recentOrders,
           staff: staffMap[s.staffId] ?? null,
         };
       }),
