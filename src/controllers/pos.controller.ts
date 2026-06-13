@@ -615,6 +615,51 @@ export const getPOSSessions = async (
       const staff = { name: u.name, email: u.email, role: u.role };
 
       if (!session) {
+        // No session record exists for this staff member, but they may
+        // still have processed COMPLETED orders (e.g. via a role/account
+        // that doesn't use session-gated POS access). Show their real
+        // all-time totals instead of hardcoded zeros — this is what the
+        // dashboard's "All-Time" column reflects too.
+        const allTimeWhere = {
+          processedById: u.id,
+          status: "COMPLETED" as const,
+        };
+
+        const [liveStats, cashStats, cardStats, transferStats, recentOrders] =
+          await Promise.all([
+            prisma.pOSOrder.aggregate({
+              where: allTimeWhere,
+              _sum: { total: true },
+              _count: { id: true },
+            }),
+            prisma.pOSOrder.aggregate({
+              where: { ...allTimeWhere, paymentMethod: "CASH" },
+              _sum: { total: true },
+            }),
+            prisma.pOSOrder.aggregate({
+              where: { ...allTimeWhere, paymentMethod: "CARD" },
+              _sum: { total: true },
+            }),
+            prisma.pOSOrder.aggregate({
+              where: { ...allTimeWhere, paymentMethod: "TRANSFER" },
+              _sum: { total: true },
+            }),
+            prisma.pOSOrder.findMany({
+              where: allTimeWhere,
+              orderBy: { createdAt: "desc" },
+              take: 10,
+              select: {
+                id: true,
+                posOrderNumber: true,
+                receiptNumber: true,
+                total: true,
+                paymentMethod: true,
+                customerName: true,
+                createdAt: true,
+              },
+            }),
+          ]);
+
         return {
           id: `no-session-${u.id}`,
           staffId: u.id,
@@ -625,13 +670,13 @@ export const getPOSSessions = async (
           closingFloat: undefined,
           expectedCash: undefined,
           variance: undefined,
-          totalSales: 0,
-          totalOrders: 0,
-          cashSales: 0,
-          cardSales: 0,
-          transferSales: 0,
+          totalSales: liveStats._sum.total || 0,
+          totalOrders: liveStats._count.id,
+          cashSales: cashStats._sum.total || 0,
+          cardSales: cardStats._sum.total || 0,
+          transferSales: transferStats._sum.total || 0,
           notes: undefined,
-          recentOrders: [],
+          recentOrders,
           staff,
         };
       }
