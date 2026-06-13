@@ -658,6 +658,7 @@ model POSOrder {
   voidedAt        DateTime?
   suspendedAt     DateTime?        // Set when status = SUSPENDED
   suspendLabel    String?          // Optional cashier note for the suspended transaction
+  sessionId       String?          @db.ObjectId // FK to the POSSession this order was made under (null = made outside any session)
 
   processedBy     User             @relation(fields: [processedById], references: [id])
 

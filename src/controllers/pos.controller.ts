@@ -30,6 +30,32 @@ export const createPOSOrder = async (
     if (!req.user) throw new AppError("Authentication required", 401);
     const staffId = req.user.userId;
 
+    // ── Require an open POS session ──────────────────────────────────────
+    // ADMIN/MANAGER can ring up sales without opening a shift session (e.g.
+    // covering a till briefly). Regular STAFF/SALES must have an open
+    // session — this is what ties their sales to a shift for cash
+    // reconciliation, and is what was missing for accounts like Patrick's
+    // (15 completed sales with no session, so they never showed up
+    // correctly on the POS Sessions page).
+    //
+    // `activeSessionId` is stored on the order itself (POSOrder.sessionId)
+    // so session totals can be computed by an exact FK match instead of
+    // guessing from a createdAt timestamp range.
+    let activeSessionId: string | undefined;
+    const openSession = await prisma.pOSSession.findFirst({
+      where: { staffId, status: "OPEN" },
+    });
+
+    if (req.user.role !== "ADMIN" && req.user.role !== "MANAGER") {
+      if (!openSession) {
+        throw new AppError(
+          "You must open a POS session before processing sales. Tap 'Open Session' to start your shift.",
+          403,
+        );
+      }
+    }
+    activeSessionId = openSession?.id;
+
     const {
       items,
       subtotal,
@@ -82,6 +108,7 @@ export const createPOSOrder = async (
           posOrderNumber,
           processedById: staffId,
           status: "COMPLETED",
+          sessionId: activeSessionId ?? null,
           subtotal,
           discountAmount: discountAmount || 0,
           discountCode: discountCode || null,
@@ -495,43 +522,32 @@ export const closePOSSession = async (
     if (session.status === "CLOSED")
       throw new AppError("Session already closed", 400);
 
+    // Exact match via sessionId FK — replaces the old createdAt-range
+    // guess, which could mis-attribute orders if sessions overlapped or a
+    // cashier's clock/timestamps were off.
+    const sessionWhere = {
+      sessionId: session.id,
+      status: "COMPLETED" as const,
+    };
+
     const salesStats = await prisma.pOSOrder.aggregate({
-      where: {
-        processedById: session.staffId,
-        status: "COMPLETED",
-        createdAt: { gte: session.openedAt },
-      },
+      where: sessionWhere,
       _sum: { total: true },
       _count: { id: true },
     });
 
     const cashStats = await prisma.pOSOrder.aggregate({
-      where: {
-        processedById: session.staffId,
-        status: "COMPLETED",
-        paymentMethod: "CASH",
-        createdAt: { gte: session.openedAt },
-      },
+      where: { ...sessionWhere, paymentMethod: "CASH" },
       _sum: { total: true },
     });
 
     const cardStats = await prisma.pOSOrder.aggregate({
-      where: {
-        processedById: session.staffId,
-        status: "COMPLETED",
-        paymentMethod: "CARD",
-        createdAt: { gte: session.openedAt },
-      },
+      where: { ...sessionWhere, paymentMethod: "CARD" },
       _sum: { total: true },
     });
 
     const transferStats = await prisma.pOSOrder.aggregate({
-      where: {
-        processedById: session.staffId,
-        status: "COMPLETED",
-        paymentMethod: "TRANSFER",
-        createdAt: { gte: session.openedAt },
-      },
+      where: { ...sessionWhere, paymentMethod: "TRANSFER" },
       _sum: { total: true },
     });
 
@@ -685,14 +701,7 @@ export const getPOSSessions = async (
       // closePOSSession — use those, plus a recent-transactions list.
       if (session.status === "CLOSED") {
         const recentOrders = await prisma.pOSOrder.findMany({
-          where: {
-            processedById: session.staffId,
-            status: "COMPLETED",
-            createdAt: {
-              gte: session.openedAt,
-              ...(session.closedAt ? { lte: session.closedAt } : {}),
-            },
-          },
+          where: { sessionId: session.id, status: "COMPLETED" },
           orderBy: { createdAt: "desc" },
           take: 10,
           select: {
@@ -711,9 +720,8 @@ export const getPOSSessions = async (
       // OPEN session — compute live totals, payment-method breakdown, and a
       // recent-transactions list so the expanded panel shows real data.
       const baseWhere = {
-        processedById: session.staffId,
+        sessionId: session.id,
         status: "COMPLETED" as const,
-        createdAt: { gte: session.openedAt },
       };
 
       const [liveStats, cashStats, cardStats, transferStats, recentOrders] =
@@ -990,6 +998,21 @@ export const holdNewPOSOrder = async (
     if (!req.user) throw new AppError("Authentication required", 401);
     const staffId = req.user.userId;
 
+    // Same session requirement as createPOSOrder — see comment there.
+    let activeSessionId: string | undefined;
+    const openSession = await prisma.pOSSession.findFirst({
+      where: { staffId, status: "OPEN" },
+    });
+    if (req.user.role !== "ADMIN" && req.user.role !== "MANAGER") {
+      if (!openSession) {
+        throw new AppError(
+          "You must open a POS session before processing sales. Tap 'Open Session' to start your shift.",
+          403,
+        );
+      }
+    }
+    activeSessionId = openSession?.id;
+
     const {
       items,
       subtotal,
@@ -1012,6 +1035,7 @@ export const holdNewPOSOrder = async (
         posOrderNumber,
         processedById: staffId,
         status: "SUSPENDED",
+        sessionId: activeSessionId ?? null,
         subtotal,
         discountAmount: discountAmount || 0,
         discountCode: discountCode || null,
