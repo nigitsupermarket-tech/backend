@@ -102,77 +102,103 @@ export const createPOSOrder = async (
     const posOrderNumber = generatePOSOrderNumber();
     const receiptNumber = generateReceiptNumber();
 
-    const posOrder = await prisma.$transaction(async (tx) => {
-      const order = await tx.pOSOrder.create({
-        data: {
-          posOrderNumber,
-          processedById: staffId,
-          status: "COMPLETED",
-          sessionId: activeSessionId ?? null,
-          subtotal,
-          discountAmount: discountAmount || 0,
-          discountCode: discountCode || null,
-          total,
-          paymentMethod,
-          amountTendered: amountTendered ?? null,
-          changeGiven: changeGiven ?? null,
-          splitPayments: splitPayments ?? undefined,
-          paymentReference: paymentReference ?? null,
-          customerName: customerName ?? null,
-          customerPhone: customerPhone ?? null,
-          notes: notes ?? null,
-          receiptNumber,
-          completedAt: new Date(),
-          items: {
-            create: items.map((item: any) => ({
-              productId: item.productId,
-              productName: item.productName,
-              productSku: item.productSku,
-              barcode: item.barcode ?? null,
-              netWeight: item.netWeight ?? null,
-              scaleUnit: item.scaleUnit ?? null,
-              quantity: item.quantity,
-              unitPrice: item.unitPrice,
-              subtotal: item.subtotal,
-              discountApplied: item.discountApplied ?? 0,
-            })),
+    // ── Order creation transaction ────────────────────────────────────────
+    // PERF FIX: previously this looped through every cart item with two
+    // sequential `await`s each (product.update + inventoryLog.create) inside
+    // a single $transaction. With many items and a remote MongoDB connection
+    // (Atlas/Neon over a Nigerian network), the cumulative round-trip time
+    // could exceed Prisma's default 5000ms interactive-transaction timeout —
+    // producing "Transaction already closed: A query cannot be executed on
+    // an expired transaction" errors exactly like the one reported.
+    //
+    // Fix: (1) run all per-item updates concurrently with Promise.all instead
+    // of sequentially, cutting wall-clock time roughly in half for
+    // multi-item carts, and (2) explicitly raise the transaction's timeout
+    // and maxWait as a safety margin for larger orders / slower networks.
+    const posOrder = await prisma.$transaction(
+      async (tx) => {
+        const order = await tx.pOSOrder.create({
+          data: {
+            posOrderNumber,
+            processedById: staffId,
+            status: "COMPLETED",
+            sessionId: activeSessionId ?? null,
+            subtotal,
+            discountAmount: discountAmount || 0,
+            discountCode: discountCode || null,
+            total,
+            paymentMethod,
+            amountTendered: amountTendered ?? null,
+            changeGiven: changeGiven ?? null,
+            splitPayments: splitPayments ?? undefined,
+            paymentReference: paymentReference ?? null,
+            customerName: customerName ?? null,
+            customerPhone: customerPhone ?? null,
+            notes: notes ?? null,
+            receiptNumber,
+            completedAt: new Date(),
+            items: {
+              create: items.map((item: any) => ({
+                productId: item.productId,
+                productName: item.productName,
+                productSku: item.productSku,
+                barcode: item.barcode ?? null,
+                netWeight: item.netWeight ?? null,
+                scaleUnit: item.scaleUnit ?? null,
+                quantity: item.quantity,
+                unitPrice: item.unitPrice,
+                subtotal: item.subtotal,
+                discountApplied: item.discountApplied ?? 0,
+              })),
+            },
           },
-        },
-        include: { items: true },
-      });
+          include: { items: true },
+        });
 
-      for (const { product, item } of validatedItems) {
-        if (product.trackInventory) {
-          await tx.product.update({
-            where: { id: product.id },
-            data: {
-              stockQuantity: { decrement: item.quantity },
-              salesCount: { increment: item.quantity },
-            },
-          });
-          await tx.inventoryLog.create({
-            data: {
-              productId: product.id,
-              type: "POS_SALE",
-              quantity: -item.quantity,
-              previousQty: product.stockQuantity,
-              newQty: product.stockQuantity - item.quantity,
-              reason: "POS sale",
-              reference: posOrderNumber,
-            },
+        // Run all per-item stock updates + inventory logs concurrently
+        // instead of one-by-one — this is the main time saver for
+        // multi-item carts.
+        await Promise.all(
+          validatedItems
+            .filter(({ product }) => product.trackInventory)
+            .map(({ product, item }) =>
+              Promise.all([
+                tx.product.update({
+                  where: { id: product.id },
+                  data: {
+                    stockQuantity: { decrement: item.quantity },
+                    salesCount: { increment: item.quantity },
+                  },
+                }),
+                tx.inventoryLog.create({
+                  data: {
+                    productId: product.id,
+                    type: "POS_SALE",
+                    quantity: -item.quantity,
+                    previousQty: product.stockQuantity,
+                    newQty: product.stockQuantity - item.quantity,
+                    reason: "POS sale",
+                    reference: posOrderNumber,
+                  },
+                }),
+              ]),
+            ),
+        );
+
+        if (discountCode) {
+          await tx.discount.updateMany({
+            where: { code: discountCode.toUpperCase() },
+            data: { usageCount: { increment: 1 } },
           });
         }
-      }
 
-      if (discountCode) {
-        await tx.discount.updateMany({
-          where: { code: discountCode.toUpperCase() },
-          data: { usageCount: { increment: 1 } },
-        });
-      }
-
-      return order;
-    });
+        return order;
+      },
+      {
+        maxWait: 10_000, // time allowed waiting for a transaction slot
+        timeout: 20_000, // time allowed for the transaction body to run
+      },
+    );
 
     logActivity({
       userId: req.user?.userId,
@@ -322,51 +348,65 @@ export const voidPOSOrder = async (
     // Only COMPLETED orders have stock deducted, so only restore stock for those
     const restoreStock = order.status === "COMPLETED";
 
-    await prisma.$transaction(async (tx) => {
-      // 1. Mark voided
-      await tx.pOSOrder.update({
-        where: { id },
-        data: {
-          status: "VOIDED",
-          voidedAt: new Date(),
-          notes: reason ?? order.notes,
-        },
-      });
+    await prisma.$transaction(
+      async (tx) => {
+        // 1. Mark voided
+        await tx.pOSOrder.update({
+          where: { id },
+          data: {
+            status: "VOIDED",
+            voidedAt: new Date(),
+            notes: reason ?? order.notes,
+          },
+        });
 
-      // 2. Fetch order items
-      const orderItems = await tx.pOSOrderItem.findMany({
-        where: { posOrderId: id },
-      });
+        // 2. Fetch order items
+        const orderItems = await tx.pOSOrderItem.findMany({
+          where: { posOrderId: id },
+        });
 
-      // 3. Restore stock — only for COMPLETED orders (hold/suspended orders
-      //    never had stock deducted, so no restoration needed)
-      if (restoreStock) {
-        for (const item of orderItems) {
-          const product = await tx.product.findUnique({
-            where: { id: item.productId },
-          });
-          if (!product) continue;
-          await tx.product.update({
-            where: { id: item.productId },
-            data: {
-              stockQuantity: { increment: item.quantity },
-              salesCount: { decrement: item.quantity },
-            },
-          });
-          await tx.inventoryLog.create({
-            data: {
-              productId: item.productId,
-              type: "RETURN",
-              quantity: item.quantity,
-              previousQty: product.stockQuantity,
-              newQty: product.stockQuantity + item.quantity,
-              reason: `POS void: ${reason || "no reason"}`,
-              reference: order.posOrderNumber,
-            },
-          });
+        // 3. Restore stock — only for COMPLETED orders (hold/suspended
+        //    orders never had stock deducted, so no restoration needed).
+        // PERF FIX: per-item product lookup + update + inventory log are
+        // now run concurrently (Promise.all) instead of sequentially, to
+        // avoid hitting Prisma's interactive-transaction timeout on larger
+        // orders — same fix applied to createPOSOrder.
+        if (restoreStock && orderItems.length > 0) {
+          await Promise.all(
+            orderItems.map(async (item) => {
+              const product = await tx.product.findUnique({
+                where: { id: item.productId },
+              });
+              if (!product) return;
+              await Promise.all([
+                tx.product.update({
+                  where: { id: item.productId },
+                  data: {
+                    stockQuantity: { increment: item.quantity },
+                    salesCount: { decrement: item.quantity },
+                  },
+                }),
+                tx.inventoryLog.create({
+                  data: {
+                    productId: item.productId,
+                    type: "RETURN",
+                    quantity: item.quantity,
+                    previousQty: product.stockQuantity,
+                    newQty: product.stockQuantity + item.quantity,
+                    reason: `POS void: ${reason || "no reason"}`,
+                    reference: order.posOrderNumber,
+                  },
+                }),
+              ]);
+            }),
+          );
         }
-      }
-    });
+      },
+      {
+        maxWait: 10_000,
+        timeout: 20_000,
+      },
+    );
 
     res
       .status(200)
