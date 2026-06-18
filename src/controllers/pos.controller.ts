@@ -76,11 +76,23 @@ export const createPOSOrder = async (
       throw new AppError("Order must have at least one item", 400);
     }
 
+    // PERF FIX: fetch all products concurrently instead of one-by-one.
+    // With 20+ items on a Nigerian network to Atlas, sequential awaits
+    // were consuming several seconds before the transaction even opened —
+    // contributing to (or causing) the 5000ms timeout that showed as
+    // "Transaction already closed: A query cannot be executed on an
+    // expired transaction." Running all lookups in parallel cuts this
+    // phase from O(n × RTT) down to ~O(1 × RTT).
+    const products = await Promise.all(
+      items.map((item: any) =>
+        prisma.product.findUnique({ where: { id: item.productId } }),
+      ),
+    );
+
     const validatedItems: any[] = [];
-    for (const item of items) {
-      const product = await prisma.product.findUnique({
-        where: { id: item.productId },
-      });
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const product = products[i];
       if (!product)
         throw new NotFoundError(`Product ${item.productId} not found`);
       if (product.status !== "ACTIVE") {
