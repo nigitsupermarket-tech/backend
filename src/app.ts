@@ -26,6 +26,7 @@ import marketingRoutes from "./routes/marketing.routes";
 import exportRoutes from "./routes/export.routes";
 import activityRoutes from "./routes/activity.routes";
 import stockApprovalRoutes from "./routes/stockApproval.routes";
+import reportRoutes from "./routes/report.routes";
 import addressRoutes from "./routes/address.routes";
 import posRoutes from "./routes/pos.routes";
 import wishlistRoutes from "./routes/wishlist.routes";
@@ -136,6 +137,7 @@ app.use(`${API_PREFIX}/payment`, paymentRoutes); // webhook uses raw(), rest use
 app.use(`${API_PREFIX}/settings`, settingsRoutes);
 app.use(`${API_PREFIX}/analytics`, analyticsRoutes);
 app.use(`${API_PREFIX}/activities`, activityRoutes);
+app.use(`${API_PREFIX}/reports`, reportRoutes);
 app.use(`${API_PREFIX}/marketing`, marketingRoutes);
 app.use(`${API_PREFIX}/export`, exportRoutes);
 app.use(`${API_PREFIX}/addresses`, addressRoutes);

@@ -191,6 +191,7 @@ export const createPOSOrder = async (
                     newQty: product.stockQuantity - item.quantity,
                     reason: "POS sale",
                     reference: posOrderNumber,
+                    performedBy: staffId,
                   },
                 }),
               ]),
@@ -207,8 +208,8 @@ export const createPOSOrder = async (
         return order;
       },
       {
-        maxWait: 10_000, // time allowed waiting for a transaction slot
-        timeout: 20_000, // time allowed for the transaction body to run
+        maxWait: 15_000, // time allowed waiting for a transaction slot
+        timeout: 40_000, // time allowed for the transaction body to run
       },
     );
 
@@ -360,6 +361,24 @@ export const voidPOSOrder = async (
     // Only COMPLETED orders have stock deducted, so only restore stock for those
     const restoreStock = order.status === "COMPLETED";
 
+    // PERF FIX: the per-item `product.findUnique` used to happen *inside*
+    // the transaction, adding a third round trip per item on top of the
+    // update + inventory log — on a slow connection (Mongo Atlas + Nigeria
+    // latency) that third read-per-item was tipping larger orders over the
+    // transaction timeout ("Transaction already closed" / batch query on an
+    // expired transaction). Reads don't need transactional isolation here,
+    // so they're done up front, and the transaction body only does the
+    // writes that actually need to be atomic.
+    const orderItems = restoreStock
+      ? await prisma.pOSOrderItem.findMany({ where: { posOrderId: id } })
+      : [];
+    const products = orderItems.length
+      ? await prisma.product.findMany({
+          where: { id: { in: orderItems.map((i) => i.productId) } },
+        })
+      : [];
+    const productMap = new Map(products.map((p) => [p.id, p]));
+
     await prisma.$transaction(
       async (tx) => {
         // 1. Mark voided
@@ -372,25 +391,14 @@ export const voidPOSOrder = async (
           },
         });
 
-        // 2. Fetch order items
-        const orderItems = await tx.pOSOrderItem.findMany({
-          where: { posOrderId: id },
-        });
-
-        // 3. Restore stock — only for COMPLETED orders (hold/suspended
+        // 2. Restore stock — only for COMPLETED orders (hold/suspended
         //    orders never had stock deducted, so no restoration needed).
-        // PERF FIX: per-item product lookup + update + inventory log are
-        // now run concurrently (Promise.all) instead of sequentially, to
-        // avoid hitting Prisma's interactive-transaction timeout on larger
-        // orders — same fix applied to createPOSOrder.
         if (restoreStock && orderItems.length > 0) {
           await Promise.all(
-            orderItems.map(async (item) => {
-              const product = await tx.product.findUnique({
-                where: { id: item.productId },
-              });
-              if (!product) return;
-              await Promise.all([
+            orderItems.map((item) => {
+              const product = productMap.get(item.productId);
+              if (!product) return Promise.resolve();
+              return Promise.all([
                 tx.product.update({
                   where: { id: item.productId },
                   data: {
@@ -407,6 +415,7 @@ export const voidPOSOrder = async (
                     newQty: product.stockQuantity + item.quantity,
                     reason: `POS void: ${reason || "no reason"}`,
                     reference: order.posOrderNumber,
+                    performedBy: req.user?.userId,
                   },
                 }),
               ]);
@@ -415,8 +424,8 @@ export const voidPOSOrder = async (
         }
       },
       {
-        maxWait: 10_000,
-        timeout: 20_000,
+        maxWait: 15_000,
+        timeout: 40_000, // headroom for larger orders on slower connections
       },
     );
 

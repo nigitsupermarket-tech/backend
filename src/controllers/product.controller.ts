@@ -328,6 +328,13 @@ export const createProduct = async (
 
     // Log inventory if initial stock provided
     if (stockQuantity && stockQuantity > 0) {
+      const creator = (req as AuthRequest).user?.userId
+        ? await prisma.user.findUnique({
+            where: { id: (req as AuthRequest).user!.userId },
+            select: { name: true },
+          })
+        : null;
+
       await prisma.inventoryLog.create({
         data: {
           productId: product.id,
@@ -336,6 +343,8 @@ export const createProduct = async (
           previousQty: 0,
           newQty: stockQuantity,
           reason: "Initial stock",
+          performedBy: (req as AuthRequest).user?.userId,
+          performedByName: creator?.name,
         },
       });
     }
@@ -551,6 +560,13 @@ export const updateInventory = async (
       newQty = quantity;
     }
 
+    const actor = req.user?.userId
+      ? await prisma.user.findUnique({
+          where: { id: req.user.userId },
+          select: { name: true },
+        })
+      : null;
+
     const [updated] = await prisma.$transaction([
       prisma.product.update({
         where: { id },
@@ -560,7 +576,16 @@ export const updateInventory = async (
         },
       }),
       prisma.inventoryLog.create({
-        data: { productId: id, type, quantity, previousQty, newQty, reason },
+        data: {
+          productId: id,
+          type,
+          quantity,
+          previousQty,
+          newQty,
+          reason,
+          performedBy: req.user?.userId,
+          performedByName: actor?.name,
+        },
       }),
     ]);
 

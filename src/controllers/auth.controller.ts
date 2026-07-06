@@ -55,6 +55,58 @@ function clearAuthCookies(res: Response) {
   res.clearCookie("refreshToken");
 }
 
+// ─── Rotating refresh token — grace window helper ──────────────────────────
+//
+// BUG FIX: previously a refresh token was single-slot — the instant it
+// rotated, the old one stopped working. If two requests both held the
+// *same* pre-rotation token (e.g. the POS tab and a second open tab/device
+// on the same account, or two API calls that both hit a 401 close together
+// and both kicked off a refresh), the loser of that race got "Invalid
+// refresh token" → hard logout, even though the account/session was
+// perfectly valid. That's what was logging cashiers out mid-checkout.
+//
+// Fix: on rotation, keep the just-replaced token valid for a short grace
+// window (60s) instead of invalidating it immediately. A request presenting
+// the previous token within that window is treated as valid and silently
+// handed the *current* tokens rather than being rejected.
+const REFRESH_GRACE_WINDOW_MS = 60_000;
+
+function isValidRefreshToken(
+  user: {
+    refreshToken: string | null;
+    previousRefreshToken: string | null;
+    previousRefreshTokenExpiresAt: Date | null;
+  },
+  token: string,
+): boolean {
+  if (user.refreshToken === token) return true;
+  if (
+    user.previousRefreshToken === token &&
+    user.previousRefreshTokenExpiresAt &&
+    user.previousRefreshTokenExpiresAt.getTime() > Date.now()
+  ) {
+    return true;
+  }
+  return false;
+}
+
+async function rotateRefreshToken(
+  userId: string,
+  oldToken: string,
+  newToken: string,
+) {
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      refreshToken: newToken,
+      previousRefreshToken: oldToken,
+      previousRefreshTokenExpiresAt: new Date(
+        Date.now() + REFRESH_GRACE_WINDOW_MS,
+      ),
+    },
+  });
+}
+
 // ─── Register ─────────────────────────────────────────────────────────────────
 
 export const register = async (
@@ -270,7 +322,7 @@ export const refreshToken = async (
       where: { id: decoded.userId },
     });
 
-    if (!user || user.refreshToken !== token) {
+    if (!user || !isValidRefreshToken(user, token)) {
       throw new UnauthorizedError("Invalid refresh token");
     }
 
@@ -280,11 +332,10 @@ export const refreshToken = async (
       role: user.role,
     });
 
-    // ✅ Rolling: save the new refresh token, invalidating the old one
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { refreshToken: tokens.refreshToken },
-    });
+    // ✅ Rolling: save the new refresh token, keeping the old one valid for
+    // a short grace window (see rotateRefreshToken above) instead of
+    // invalidating it immediately.
+    await rotateRefreshToken(user.id, token, tokens.refreshToken);
 
     // ✅ Re-set cookies with fresh 30-day window
     setAuthCookies(res, tokens.accessToken, tokens.refreshToken);
@@ -346,6 +397,8 @@ export const silentRefresh = async (
         role: true,
         emailVerified: true,
         refreshToken: true,
+        previousRefreshToken: true,
+        previousRefreshTokenExpiresAt: true,
         customerSegment: true,
         totalSpent: true,
         orderCount: true,
@@ -353,7 +406,7 @@ export const silentRefresh = async (
       },
     });
 
-    if (!user || user.refreshToken !== token) {
+    if (!user || !isValidRefreshToken(user, token)) {
       clearAuthCookies(res);
       res.status(401).json({ success: false, message: "Session invalid" });
       return;
@@ -365,15 +418,17 @@ export const silentRefresh = async (
       role: user.role,
     });
 
-    // Rolling: save new refresh token
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { refreshToken: tokens.refreshToken },
-    });
+    // Rolling: save new refresh token, keeping the old one valid briefly
+    await rotateRefreshToken(user.id, token, tokens.refreshToken);
 
     setAuthCookies(res, tokens.accessToken, tokens.refreshToken);
 
-    const { refreshToken: _rt, ...safeUser } = user;
+    const {
+      refreshToken: _rt,
+      previousRefreshToken: _prt,
+      previousRefreshTokenExpiresAt: _prte,
+      ...safeUser
+    } = user;
 
     res.status(200).json({
       success: true,

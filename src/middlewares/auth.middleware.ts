@@ -61,6 +61,42 @@ export const salesOrAdmin = restrictTo("ADMIN", "SALES");
 // that MANAGER is allowed into (but regular STAFF/SALES are not).
 export const adminOrManager = restrictTo("ADMIN", "MANAGER");
 
+// Finance/accounting routes — ADMIN, MANAGER, and the new ACCOUNTANT role.
+// ACCOUNTANT owns the finance dashboard (payments, reconciliation, reports)
+// but is never given POS/inventory write access.
+export const financeAccess = restrictTo("ADMIN", "MANAGER", "ACCOUNTANT");
+
+// Read-only visibility into stock movement/approval history — everyone who
+// needs oversight of stock changes, but not necessarily the power to
+// approve/reject them.
+export const stockHistoryAccess = restrictTo(
+  "ADMIN",
+  "MANAGER",
+  "ACCOUNTANT",
+);
+
+// Universal report-generation access — every authenticated staff-side role
+// may generate reports; the controller itself scopes *what* each role can
+// see (e.g. SALES/STAFF can only ever pull their own activity).
+export const reportsAccess = restrictTo(
+  "ADMIN",
+  "MANAGER",
+  "ACCOUNTANT",
+  "SALES",
+  "STAFF",
+);
+
+// Read access for the dashboard/analytics screens — all staff-side roles
+// plus ACCOUNTANT (finance needs visibility into revenue/analytics without
+// gaining POS or inventory write access).
+export const analyticsAccess = restrictTo(
+  "ADMIN",
+  "STAFF",
+  "SALES",
+  "MANAGER",
+  "ACCOUNTANT",
+);
+
 export const optionalAuth = async (
   req: AuthRequest,
   res: Response,

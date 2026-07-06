@@ -4,11 +4,11 @@ import {
   getDashboardStats, getRevenueChart, getTopProducts,
   getInventoryReport, getCustomerStats, getOrdersByStatus, getStaffStats,
 } from "../controllers/analytics.controller";
-import { protect, staffOrAdmin, adminOnly, salesOrAdmin } from "../middlewares/auth.middleware";
+import { protect, analyticsAccess, salesOrAdmin } from "../middlewares/auth.middleware";
 
 const router = Router();
 
-router.use(protect, staffOrAdmin);
+router.use(protect, analyticsAccess);
 
 router.get("/dashboard", getDashboardStats);
 router.get("/revenue", getRevenueChart);

@@ -46,6 +46,8 @@ export const createStockRequest = async (
           newQty: requestedQty,
           reason: reason || "Admin stock adjustment",
           reference: `admin:${req.user!.userId}`,
+          performedBy: req.user!.userId,
+          performedByName: user.name,
         },
       });
 
@@ -236,6 +238,8 @@ export const approveStockRequest = async (
           newQty: request.requestedQty,
           reason: `Approved by ${admin?.name || "admin"} — ${request.reason || "stock adjustment"}`,
           reference: `approval:${id}`,
+          performedBy: req.user!.userId,
+          performedByName: admin?.name || "Admin",
         },
       }),
       prisma.stockApprovalRequest.update({
@@ -358,6 +362,8 @@ export const bulkApproveStockRequests = async (
               newQty: request.requestedQty,
               reason: `Bulk approved by ${admin?.name || "admin"}`,
               reference: `approval:${request.id}`,
+              performedBy: req.user!.userId,
+              performedByName: admin?.name || "Admin",
             },
           }),
           prisma.stockApprovalRequest.update({

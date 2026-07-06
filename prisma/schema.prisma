@@ -21,6 +21,7 @@ enum UserRole {
   ADMIN
   SALES
   MANAGER
+  ACCOUNTANT
 }
 
 model User {
@@ -34,6 +35,13 @@ model User {
   password          String
   role              UserRole  @default(CUSTOMER)
   refreshToken      String?
+  // Grace window for rotating refresh tokens: when a refresh token is  
+  // rotated, the previous one is kept valid for a short window so a
+  // near-simultaneous refresh from another tab/device (e.g. a cashier with
+  // the POS open in one tab and the dashboard open in another) doesn't get
+  // hard-logged-out just because it lost the rotation race.
+  previousRefreshToken           String?
+  previousRefreshTokenExpiresAt  DateTime?
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
   lastLogin         DateTime?
@@ -362,15 +370,19 @@ model Review {
 }
 
 model InventoryLog {
-  id          String   @id @default(auto()) @map("_id") @db.ObjectId
-  productId   String   @db.ObjectId
-  type        String   // PURCHASE, SALE, ADJUSTMENT, RETURN, POS_SALE, EXPIRY
-  quantity    Float  // Float supports scalable product log entries
-  previousQty Float
-  newQty      Float
-  reason      String?
-  reference   String?  // Order ID or POS order ID
-  createdAt   DateTime @default(now())
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  productId       String   @db.ObjectId
+  type            String   // PURCHASE, SALE, ADJUSTMENT, RETURN, POS_SALE, EXPIRY
+  quantity        Float  // Float supports scalable product log entries
+  previousQty     Float
+  newQty          Float
+  reason          String?
+  reference       String?  // Order ID or POS order ID
+  // Attribution — who effected this stock change. Populated at write time so
+  // reporting doesn't have to reverse-engineer it from `reference`.
+  performedBy     String?  @db.ObjectId
+  performedByName String?
+  createdAt       DateTime @default(now())
 
   product     Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
 
