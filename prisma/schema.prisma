@@ -35,7 +35,7 @@ model User {
   password          String
   role              UserRole  @default(CUSTOMER)
   refreshToken      String?
-  // Grace window for rotating refresh tokens: when a refresh token is  
+  // Grace window for rotating refresh tokens: when a refresh token is
   // rotated, the previous one is kept valid for a short window so a
   // near-simultaneous refresh from another tab/device (e.g. a cashier with
   // the POS open in one tab and the dashboard open in another) doesn't get

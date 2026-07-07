@@ -103,7 +103,10 @@ function resolveUserScope(
 function resolvePagination(req: AuthRequest): { page: number; limit: number } {
   const page = Math.max(1, parseInt((req.query.page as string) || "1", 10) || 1);
   const limit = Math.min(
-    100,
+    // 100 covers normal on-screen paging; the PDF export requests a single
+    // large page (see reports/page.tsx) instead of looping, so the ceiling
+    // needs to be high enough to cover a full reporting period in one call.
+    2000,
     Math.max(1, parseInt((req.query.limit as string) || "20", 10) || 20),
   );
   return { page, limit };
