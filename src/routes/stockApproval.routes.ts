@@ -11,9 +11,7 @@ import {
 import {
   protect,
   adminOnly,
-  adminOrManager,
   staffOrAdmin,
-  stockHistoryAccess,
 } from "../middlewares/auth.middleware";
 
 const router = Router();
@@ -23,14 +21,13 @@ router.use(protect);
 // Staff & Admin — submit a request (admin auto-approves)
 router.post("/", staffOrAdmin, createStockRequest);
 
-// Admin, Manager, Accountant — VIEW the full request/approval history.
-// (Accountant is read-only here; it does not get the approve/reject routes.)
-router.get("/", stockHistoryAccess, getStockRequests);
-router.get("/pending-count", adminOrManager, getPendingCount);
+// Admin only — the whole approval queue, including read/history, is now
+// Admin-exclusive (Manager and Accountant previously had read-only access;
+// that's removed too, not just their ability to act).
+router.get("/", adminOnly, getStockRequests);
+router.get("/pending-count", adminOnly, getPendingCount);
 
-// Admin only — action requests (approve/reject/bulk). Managers can view the
-// queue (see stockHistoryAccess above) but can no longer action it — only
-// Admin has final say on stock changes.
+// Admin only — action requests (approve/reject/bulk).
 router.post("/bulk-approve", adminOnly, bulkApproveStockRequests);
 router.post("/:id/approve", adminOnly, approveStockRequest);
 router.post("/:id/reject", adminOnly, rejectStockRequest);

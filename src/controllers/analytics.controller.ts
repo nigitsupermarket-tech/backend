@@ -236,6 +236,7 @@ export const getDashboardStats = async (
       allTimeRevenue,
       allTimePOSSales,
       staffList,
+      allTimePOSOrders,
     ] = await Promise.all([
       prisma.order.count({ where: { paymentStatus: "PAID" } }),
       prisma.order.count({ where: { createdAt: { gte: startOfToday } } }),
@@ -292,6 +293,11 @@ export const getDashboardStats = async (
           select: { id: true, name: true, email: true, role: true },
         })
         .catch(() => []),
+      // All-time POS order count — needed alongside the online order count
+      // to report a true combined total (see `combined` below). Without
+      // this the "Total Orders"/"Avg Order Value" the Analytics page shows
+      // only ever reflected online orders, even on a POS-only business.
+      prisma.pOSOrder.count({ where: { status: "COMPLETED" } }),
     ]);
 
     const staffStats = await Promise.all(
@@ -399,6 +405,21 @@ export const getDashboardStats = async (
           total:
             (allTimeRevenue._sum.total || 0) +
             (allTimePOSSales._sum.total || 0),
+        },
+        // Combined online + POS, all-time — this is what the Analytics
+        // page's headline cards use. `orders.total` above stays online-only
+        // since that's what the Dashboard page's existing cards mean by it.
+        combined: {
+          totalOrders: totalOrders + allTimePOSOrders,
+          totalRevenue:
+            (allTimeRevenue._sum.total || 0) +
+            (allTimePOSSales._sum.total || 0),
+          avgOrderValue:
+            totalOrders + allTimePOSOrders > 0
+              ? ((allTimeRevenue._sum.total || 0) +
+                  (allTimePOSSales._sum.total || 0)) /
+                (totalOrders + allTimePOSOrders)
+              : 0,
         },
         staffSales: staffStats,
       },
@@ -607,20 +628,77 @@ export const getTopProducts = async (
   next: NextFunction,
 ) => {
   try {
-    const { period = "30" } = req.query;
+    const { period = "30", limit } = req.query;
     const days = Math.min(Number(period), 365);
+    const take = Math.min(Math.max(Number(limit) || 5, 1), 50);
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
-    const topProducts = await prisma.orderItem.groupBy({
-      by: ["productId"],
-      where: {
-        order: { createdAt: { gte: startDate }, paymentStatus: "PAID" },
-      },
-      _sum: { quantity: true, price: true },
-      orderBy: { _sum: { quantity: "desc" } },
-      take: 10,
+
+    // Top products used to be online-order-only, which meant a store that
+    // sells mainly through POS saw an empty list here even with plenty of
+    // sales. Tally both channels and merge before ranking.
+    const [onlineItems, posItems] = await Promise.all([
+      prisma.orderItem.groupBy({
+        by: ["productId"],
+        where: {
+          order: { createdAt: { gte: startDate }, paymentStatus: "PAID" },
+        },
+        _sum: { quantity: true, price: true },
+      }),
+      prisma.pOSOrderItem.groupBy({
+        by: ["productId"],
+        where: {
+          posOrder: {
+            createdAt: { gte: startDate },
+            status: "COMPLETED",
+          },
+        },
+        _sum: { quantity: true, subtotal: true },
+      }),
+    ]);
+
+    const tally = new Map<string, { quantity: number; revenue: number }>();
+    for (const i of onlineItems) {
+      const prev = tally.get(i.productId) || { quantity: 0, revenue: 0 };
+      tally.set(i.productId, {
+        quantity: prev.quantity + (i._sum.quantity || 0),
+        revenue: prev.revenue + (i._sum.price || 0),
+      });
+    }
+    for (const i of posItems) {
+      const prev = tally.get(i.productId) || { quantity: 0, revenue: 0 };
+      tally.set(i.productId, {
+        quantity: prev.quantity + (i._sum.quantity || 0),
+        revenue: prev.revenue + (i._sum.subtotal || 0),
+      });
+    }
+
+    const ranked = [...tally.entries()]
+      .sort((a, b) => b[1].quantity - a[1].quantity)
+      .slice(0, take);
+
+    const products = await prisma.product.findMany({
+      where: { id: { in: ranked.map(([id]) => id) } },
+      select: { id: true, name: true, images: true, sku: true },
     });
-    res.status(200).json({ success: true, data: { topProducts } });
+    const productMap = new Map(products.map((p) => [p.id, p]));
+
+    const result = ranked
+      .map(([productId, agg]) => {
+        const p = productMap.get(productId);
+        if (!p) return null;
+        return {
+          id: p.id,
+          name: p.name,
+          sku: p.sku,
+          images: p.images,
+          salesCount: agg.quantity,
+          revenue: agg.revenue,
+        };
+      })
+      .filter(Boolean);
+
+    res.status(200).json({ success: true, data: { products: result } });
   } catch (error) {
     next(error);
   }
@@ -744,11 +822,31 @@ export const getOrdersByStatus = async (
   next: NextFunction,
 ) => {
   try {
-    const statusBreakdown = await prisma.order.groupBy({
-      by: ["status"],
-      _count: true,
-      _sum: { total: true },
-    });
+    const [onlineBreakdown, posBreakdown] = await Promise.all([
+      prisma.order.groupBy({ by: ["status"], _count: true, _sum: { total: true } }),
+      prisma.pOSOrder.groupBy({ by: ["status"], _count: true, _sum: { total: true } }),
+    ]);
+
+    // Prefixed so a pie/legend can tell "Online: SHIPPED" apart from
+    // "POS: COMPLETED" — the two order types use different status enums
+    // entirely, so merging them without labels would be misleading.
+    const statusBreakdown = [
+      ...onlineBreakdown.map((s) => ({
+        channel: "Online",
+        status: s.status,
+        label: `Online: ${s.status}`,
+        count: s._count,
+        total: s._sum.total || 0,
+      })),
+      ...posBreakdown.map((s) => ({
+        channel: "POS",
+        status: s.status,
+        label: `POS: ${s.status}`,
+        count: s._count,
+        total: s._sum.total || 0,
+      })),
+    ];
+
     res.status(200).json({ success: true, data: { statusBreakdown } });
   } catch (error) {
     next(error);
