@@ -13,7 +13,11 @@ import {
   getNewArrivals,
   updateInventory,
 } from "../controllers/product.controller";
-import { protect, staffOrAdmin, adminOnly } from "../middlewares/auth.middleware";
+import {
+  protect,
+  staffOrAdmin,
+  adminOrManager,
+} from "../middlewares/auth.middleware";
 
 const router = Router();
 
@@ -25,7 +29,7 @@ router.get("/:id", getProduct);
 router.post("/", protect, staffOrAdmin, createProduct);
 router.put("/:id", protect, staffOrAdmin, updateProduct);
 router.put("/:id/inventory", protect, staffOrAdmin, updateInventory);
-// Only ADMIN can permanently delete products
-router.delete("/:id", protect, adminOnly, deleteProduct);
+// Only ADMIN and MANAGER can permanently (hard) delete products
+router.delete("/:id", protect, adminOrManager, deleteProduct);
 
 export default router;
