@@ -8,11 +8,52 @@ import {
   sendTrackingUpdateEmail,
   sendAdminNewOrderEmail,
 } from "../services/email.service";
+import { restoreStockForOrder } from "../lib/orderStock";
 
 const generateOrderNumber = () =>
   `ORD-${Date.now().toString().slice(-8)}-${Math.floor(Math.random() * 1000)
     .toString()
     .padStart(3, "0")}`;
+
+// ── Email automation mode lookup (Settings → Notifications) ──────────────────
+// Both default to "manual" (see SiteSetting schema) — an auto-send only
+// happens once a super admin explicitly flips it on.
+async function getEmailAutomationModes(): Promise<{
+  invoiceEmailMode: "manual" | "auto";
+  orderStatusEmailMode: "manual" | "auto";
+}> {
+  const settings = await prisma.siteSetting.findFirst({
+    select: { invoiceEmailMode: true, orderStatusEmailMode: true },
+  });
+  return {
+    invoiceEmailMode:
+      (settings?.invoiceEmailMode as "manual" | "auto") || "manual",
+    orderStatusEmailMode:
+      (settings?.orderStatusEmailMode as "manual" | "auto") || "manual",
+  };
+}
+
+// Sends the order-confirmation/invoice email if it hasn't gone out yet.
+// Called both right after order creation and (defensively) from payment
+// confirmation — the invoiceEmailSent flag guarantees it only ever sends once.
+export async function maybeSendInvoiceEmail(orderId: string): Promise<void> {
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!order || order.invoiceEmailSent) return;
+
+  const { invoiceEmailMode } = await getEmailAutomationModes();
+  if (invoiceEmailMode !== "auto") return; // manual — staff sends via "Send Invoice"
+
+  await sendOrderConfirmationEmail(
+    order.customerEmail,
+    order.customerName,
+    order.orderNumber,
+    order.total,
+  );
+  await prisma.order.update({
+    where: { id: orderId },
+    data: { invoiceEmailSent: true },
+  });
+}
 
 // GET /api/v1/orders
 export const getOrders = async (
@@ -149,16 +190,40 @@ export const updateOrderStatus = async (
     ]);
 
     if (status === "CANCELLED") {
-      const items = await prisma.orderItem.findMany({ where: { orderId: id } });
-      for (const item of items) {
-        await prisma.product.update({
-          where: { id: item.productId },
-          data: {
-            stockQuantity: { increment: item.quantity },
-            salesCount: { decrement: item.quantity },
-          },
-        });
-      }
+      // Only restores stock if it was actually deducted (i.e. payment had
+      // been confirmed) — orders cancelled before payment never touched
+      // inventory, so there's nothing to give back.
+      await restoreStockForOrder(
+        id,
+        "Order cancelled by staff",
+        req.user?.userId
+          ? { id: req.user.userId, name: req.user.email }
+          : undefined,
+      );
+    }
+
+    // Customer status-change notification — respects Settings →
+    // Notifications → "Order status email" mode (manual by default; staff
+    // sends it via the "Notify Customer" button unless a super admin turns
+    // auto on).
+    const { orderStatusEmailMode } = await getEmailAutomationModes();
+    if (orderStatusEmailMode === "auto") {
+      sendTrackingUpdateEmail(
+        order.customerEmail,
+        order.customerName,
+        order.orderNumber,
+        status,
+        notes || `Your order status has been updated to ${status}.`,
+      )
+        .then(() =>
+          prisma.order.update({
+            where: { id },
+            data: { lastStatusEmailAt: new Date() },
+          }),
+        )
+        .catch((err) =>
+          console.error("[email] Status update email failed:", err),
+        );
     }
 
     logActivity({
@@ -222,19 +287,9 @@ export const cancelOrder = async (
       }),
     ]);
 
-    for (const item of order.items) {
-      // Only restore stock if payment was confirmed — stock is only deducted
-      // at payment confirmation, not at order creation.
-      if (order.paymentStatus === "PAID") {
-        await prisma.product.update({
-          where: { id: item.productId },
-          data: {
-            stockQuantity: { increment: item.quantity },
-            salesCount: { decrement: item.quantity },
-          },
-        });
-      }
-    }
+    // Only restores stock if it was actually deducted (i.e. payment had
+    // been confirmed) — guarded internally by Order.stockDeducted.
+    await restoreStockForOrder(id, "Order cancelled by customer");
 
     res
       .status(200)
@@ -521,13 +576,12 @@ export const createOrder = async (
       }),
     ]);
 
-    // Fire-and-forget — SMTP timeouts must never block the HTTP response
-    sendOrderConfirmationEmail(
-      user.email,
-      user.name,
-      order.orderNumber,
-      total,
-    ).catch((err) => console.error("[email] Order confirmation failed:", err));
+    // Invoice/order-confirmation email — respects Settings → Notifications
+    // → "Invoice email" mode (manual by default; staff sends it via the
+    // "Send Invoice" button on the order unless a super admin turns auto on).
+    maybeSendInvoiceEmail(order.id).catch((err) =>
+      console.error("[email] Order confirmation failed:", err),
+    );
 
     // Notify admin notification emails (configured in Settings → Notifications)
     prisma.siteSetting
@@ -627,16 +681,27 @@ export const addTrackingUpdate = async (
       },
     });
 
-    // Fire-and-forget — SMTP timeouts must never block the response
-    sendTrackingUpdateEmail(
-      order.user.email,
-      order.user.name,
-      order.orderNumber,
-      status,
-      message,
-    ).catch((err) =>
-      console.error("[email] Tracking update email failed:", err),
-    );
+    // Customer tracking-event notification — respects Settings →
+    // Notifications → "Order status email" mode (manual by default).
+    const { orderStatusEmailMode } = await getEmailAutomationModes();
+    if (orderStatusEmailMode === "auto") {
+      sendTrackingUpdateEmail(
+        order.user.email,
+        order.user.name,
+        order.orderNumber,
+        status,
+        message,
+      )
+        .then(() =>
+          prisma.order.update({
+            where: { id },
+            data: { lastStatusEmailAt: new Date() },
+          }),
+        )
+        .catch((err) =>
+          console.error("[email] Tracking update email failed:", err),
+        );
+    }
 
     res.status(201).json({
       success: true,
@@ -670,6 +735,97 @@ export const updateTrackingNumber = async (
       success: true,
       message: "Tracking number updated",
       data: { order: updated },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/v1/orders/:id/send-invoice
+// Manual trigger for the order-confirmation/invoice email — used when
+// Settings → Notifications → Invoice email mode is "manual" (the default).
+// Staff-side only (see staffOrAdmin on the route); can be re-sent any time.
+export const sendInvoiceManually = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const order = await prisma.order.findUnique({ where: { id } });
+    if (!order) throw new NotFoundError("Order not found");
+
+    await sendOrderConfirmationEmail(
+      order.customerEmail,
+      order.customerName,
+      order.orderNumber,
+      order.total,
+    );
+
+    await prisma.order.update({
+      where: { id },
+      data: { invoiceEmailSent: true },
+    });
+
+    logActivity({
+      userId: req.user?.userId,
+      action: "send invoice email",
+      entity: "order",
+      entityId: id,
+      metadata: { orderNumber: order.orderNumber },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Invoice sent to ${order.customerEmail}`,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/v1/orders/:id/notify-status
+// Manual trigger for the order-status-update email — used when
+// Settings → Notifications → Order status email mode is "manual" (the
+// default). Sends a notification for the order's CURRENT status.
+// Staff-side only (see staffOrAdmin on the route).
+export const notifyOrderStatus = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const { notes } = req.body;
+    const order = await prisma.order.findUnique({ where: { id } });
+    if (!order) throw new NotFoundError("Order not found");
+
+    await sendTrackingUpdateEmail(
+      order.customerEmail,
+      order.customerName,
+      order.orderNumber,
+      order.status,
+      notes || `Your order status has been updated to ${order.status}.`,
+    );
+
+    await prisma.order.update({
+      where: { id },
+      data: { lastStatusEmailAt: new Date() },
+    });
+
+    logActivity({
+      userId: req.user?.userId,
+      action: "notify customer of order status",
+      entity: "order",
+      entityId: id,
+      metadata: { orderNumber: order.orderNumber, status: order.status },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Customer notified at ${order.customerEmail}`,
     });
   } catch (error) {
     next(error);

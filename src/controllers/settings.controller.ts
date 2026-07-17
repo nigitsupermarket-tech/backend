@@ -467,7 +467,11 @@ export const updateAboutUs = async (
 
     // If a new about-us image is uploaded, delete the old one from Cloudinary
     if (aboutUsImage !== undefined) {
-      if (aboutUsImage && settings.aboutUsImage && aboutUsImage !== settings.aboutUsImage) {
+      if (
+        aboutUsImage &&
+        settings.aboutUsImage &&
+        aboutUsImage !== settings.aboutUsImage
+      ) {
         await deleteCloudinaryImage(settings.aboutUsImage);
       }
       data.aboutUsImage = aboutUsImage;
@@ -610,24 +614,62 @@ export const updateNotifications = async (
   next: NextFunction,
 ) => {
   try {
-    const { adminNotificationEmails } = req.body;
+    const { adminNotificationEmails, orderStatusEmailMode, invoiceEmailMode } =
+      req.body;
+    const data: any = {};
 
-    // Validate — must be an array of valid email strings
-    if (!Array.isArray(adminNotificationEmails)) {
-      return res
-        .status(400)
-        .json({ success: false, message: "adminNotificationEmails must be an array" });
+    // adminNotificationEmails is optional on this endpoint now — only
+    // validate/apply it if the caller actually sent it.
+    if (adminNotificationEmails !== undefined) {
+      if (!Array.isArray(adminNotificationEmails)) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: "adminNotificationEmails must be an array",
+          });
+      }
+
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      const invalid = adminNotificationEmails.filter(
+        (e: any) => typeof e !== "string" || !emailRegex.test(e.trim()),
+      );
+      if (invalid.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid email address(es): ${invalid.join(", ")}`,
+        });
+      }
+      data.adminNotificationEmails = adminNotificationEmails.map((e: string) =>
+        e.trim(),
+      );
     }
 
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    const invalid = adminNotificationEmails.filter(
-      (e: any) => typeof e !== "string" || !emailRegex.test(e.trim()),
-    );
-    if (invalid.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message: `Invalid email address(es): ${invalid.join(", ")}`,
-      });
+    // Order status / invoice email automation — "manual" (default) or "auto"
+    const validModes = ["manual", "auto"];
+    if (orderStatusEmailMode !== undefined) {
+      if (!validModes.includes(orderStatusEmailMode)) {
+        return res.status(400).json({
+          success: false,
+          message: "orderStatusEmailMode must be 'manual' or 'auto'",
+        });
+      }
+      data.orderStatusEmailMode = orderStatusEmailMode;
+    }
+    if (invoiceEmailMode !== undefined) {
+      if (!validModes.includes(invoiceEmailMode)) {
+        return res.status(400).json({
+          success: false,
+          message: "invoiceEmailMode must be 'manual' or 'auto'",
+        });
+      }
+      data.invoiceEmailMode = invoiceEmailMode;
+    }
+
+    if (Object.keys(data).length === 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "No valid fields provided" });
     }
 
     let settings = await prisma.siteSetting.findFirst();
@@ -635,7 +677,7 @@ export const updateNotifications = async (
 
     const updated = await prisma.siteSetting.update({
       where: { id: settings.id },
-      data: { adminNotificationEmails: adminNotificationEmails.map((e: string) => e.trim()) },
+      data,
     });
 
     invalidateSettingsCache();

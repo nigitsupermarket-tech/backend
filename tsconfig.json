@@ -29,6 +29,6 @@
       "@types/*": ["./types/*"]
     }
   },
-  "include": ["src/**/*", "script"],
+  "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
 }

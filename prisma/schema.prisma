@@ -123,6 +123,18 @@ model SiteSetting {
   // Admin Notification Emails
   adminNotificationEmails String[] @default([])
 
+  // Order Email Automation (super admin / ADMIN only, via Settings →
+  // Notifications). "manual" = staff must click Send/Notify in the admin
+  // order screen. "auto" = sent automatically the moment the trigger
+  // happens. Defaults to manual for both.
+  // - invoiceEmailMode: controls the order-confirmation/invoice email
+  //   sent after an order is placed.
+  // - orderStatusEmailMode: controls the notification email sent whenever
+  //   an order's status changes (status update, tracking event, payment
+  //   confirmation, etc).
+  invoiceEmailMode      String   @default("manual") // "manual" | "auto"
+  orderStatusEmailMode  String   @default("manual") // "manual" | "auto"
+
   // Payment Settings
   paystackPublicKey String?
   paystackSecretKey String?
@@ -549,6 +561,10 @@ model Order {
   // Notes
   customerNotes     String?
   adminNotes        String?
+
+  stockDeducted     Boolean       @default(false)
+  invoiceEmailSent  Boolean       @default(false)
+  lastStatusEmailAt DateTime?
 
   // Timeline
   createdAt         DateTime      @default(now())

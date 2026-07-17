@@ -9,6 +9,8 @@ import {
   sendBankTransferInstructionsEmail,
   sendBankTransferConfirmedEmail,
 } from "../services/email.service";
+import { deductStockForOrder, restoreStockForOrder } from "../lib/orderStock";
+import { maybeSendInvoiceEmail } from "./order.controller";
 
 const PAYSTACK_SECRET = () => process.env.PAYSTACK_SECRET_KEY!;
 const paystackHeaders = () => ({
@@ -177,12 +179,17 @@ export const verifyPayment = async (
           }),
         ]);
 
-        sendOrderConfirmationEmail(
-          order.customerEmail,
-          order.customerName,
-          order.orderNumber,
-          order.total,
-        ).catch(console.error);
+        // Stock is deducted here, at payment confirmation — not at order
+        // creation — so abandoned/unpaid orders never tie up inventory.
+        deductStockForOrder(metadata.orderId).catch((err) =>
+          console.error("[stock] Deduction failed:", err),
+        );
+
+        // Invoice email — guarded by invoiceEmailSent, so this is a no-op
+        // if it already went out at order creation (invoiceEmailMode=auto).
+        maybeSendInvoiceEmail(metadata.orderId).catch((err) =>
+          console.error("[email] Order confirmation failed:", err),
+        );
       }
     }
 
@@ -243,6 +250,13 @@ export const paystackWebhook = async (
               },
             }),
           ]);
+
+          deductStockForOrder(metadata.orderId).catch((err) =>
+            console.error("[stock] Deduction failed:", err),
+          );
+          maybeSendInvoiceEmail(metadata.orderId).catch((err) =>
+            console.error("[email] Order confirmation failed:", err),
+          );
         }
       }
     }
@@ -254,6 +268,10 @@ export const paystackWebhook = async (
           where: { id: metadata.orderId },
           data: { paymentStatus: "REFUNDED", status: "REFUNDED" },
         });
+        restoreStockForOrder(
+          metadata.orderId,
+          "Payment refunded via Paystack",
+        ).catch((err) => console.error("[stock] Restore failed:", err));
       }
     }
 
@@ -401,13 +419,39 @@ export const confirmBankTransfer = async (
       }),
     ]);
 
-    // Notify customer
-    sendBankTransferConfirmedEmail(
-      order.customerEmail,
-      order.customerName,
-      order.orderNumber,
-      order.total,
-    ).catch(console.error);
+    // Stock is deducted here, at payment confirmation — not at order
+    // creation — so abandoned/unpaid orders never tie up inventory.
+    deductStockForOrder(orderId).catch((err) =>
+      console.error("[stock] Deduction failed:", err),
+    );
+
+    // Notify customer — respects Settings → Notifications → "Order status
+    // email" mode (manual by default; staff sends it via "Notify Customer"
+    // on the order page unless a super admin turns auto on).
+    const settings = await prisma.siteSetting.findFirst({
+      select: { orderStatusEmailMode: true },
+    });
+    if ((settings?.orderStatusEmailMode || "manual") === "auto") {
+      sendBankTransferConfirmedEmail(
+        order.customerEmail,
+        order.customerName,
+        order.orderNumber,
+        order.total,
+      )
+        .then(() =>
+          prisma.order.update({
+            where: { id: orderId },
+            data: { lastStatusEmailAt: new Date() },
+          }),
+        )
+        .catch(console.error);
+    }
+
+    // Invoice email — guarded by invoiceEmailSent, so this is a no-op if
+    // it already went out at order creation (invoiceEmailMode=auto).
+    maybeSendInvoiceEmail(orderId).catch((err) =>
+      console.error("[email] Order confirmation failed:", err),
+    );
 
     res.status(200).json({
       success: true,
