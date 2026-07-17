@@ -49,12 +49,17 @@ const API_PREFIX = "/api/v1";
 // CORS (must come before everything)
 // ============================================
 
+const normalizeOrigin = (url?: string) =>
+  url?.trim().replace(/\/+$/, "").toLowerCase();
+
 const allowedOrigins = [
   process.env.CLIENT_URL,
   process.env.CLIENT_URL_2,
   process.env.CLIENT_URL_3,
   process.env.CLIENT_URL_4,
-].filter(Boolean) as string[];
+]
+  .filter(Boolean)
+  .map((url) => normalizeOrigin(url) as string);
 
 const corsOptions = {
   origin: (
@@ -62,7 +67,11 @@ const corsOptions = {
     callback: (err: Error | null, allow?: boolean) => void,
   ) => {
     if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
+    if (allowedOrigins.includes(normalizeOrigin(origin) as string))
+      return callback(null, true);
+    console.warn(
+      `[CORS] Rejected origin "${origin}". Allowed: ${allowedOrigins.join(", ") || "(none configured)"}`,
+    );
     callback(new Error(`CORS: origin ${origin} not allowed`));
   },
   credentials: true,
