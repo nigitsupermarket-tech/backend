@@ -384,7 +384,7 @@ model Review {
 model InventoryLog {
   id              String   @id @default(auto()) @map("_id") @db.ObjectId
   productId       String   @db.ObjectId
-  type            String   // PURCHASE, SALE, ADJUSTMENT, RETURN, POS_SALE, EXPIRY
+  type            String   // PURCHASE, SALE, ADJUSTMENT, RETURN, POS_SALE, EXPIRY, ONLINE_SALE, ONLINE_RETURN
   quantity        Float  // Float supports scalable product log entries
   previousQty     Float
   newQty          Float
@@ -562,8 +562,18 @@ model Order {
   customerNotes     String?
   adminNotes        String?
 
+  // Stock & notification tracking
+  // stockDeducted: true once inventory has actually been decremented for
+  // this order — happens at payment confirmation, not at order creation.
+  // Used as the idempotency guard for deduct/restore so it never double-fires.
   stockDeducted     Boolean       @default(false)
+  // invoiceEmailSent: true once the order-confirmation/invoice email has
+  // gone out (either automatically, per SiteSetting.invoiceEmailMode, or
+  // via the manual "Send Invoice" action).
   invoiceEmailSent  Boolean       @default(false)
+  // Last time a status-change notification email was sent to the customer
+  // (either automatically, per SiteSetting.orderStatusEmailMode, or via
+  // the manual "Notify Customer" action).
   lastStatusEmailAt DateTime?
 
   // Timeline

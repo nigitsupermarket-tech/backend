@@ -1,26 +1,5 @@
 // backend/src/controllers/report.controller.ts
-//
-// Unified, role-scoped report generator.
-//
-//   GET /api/v1/reports?type=<type>&interval=<interval>&from&to&userId&page&limit
-//
-//   type:      overview | stock | stock-approvals | sales | pos | activity
-//   interval:  session | today | week | month | year | custom
-//   userId:    optional — ADMIN/MANAGER/ACCOUNTANT may request any user's
-//              report (or omit it for an org-wide report). SALES/STAFF are
-//              always pinned to their own userId, no matter what is passed.
-//   sessionId: required when interval=session — scopes the report to a
-//              single POS session's window (open→close, or open→now).
-//   from/to:   required when interval=custom (ISO date strings).
-//   page/limit: pagination for the row-level detail tables (stock,
-//              stock-approvals, activity). Ignored by sales/pos/overview,
-//              which only return summary numbers.
-//
-// The endpoint is intentionally a single, generic entry point so every role
-// hits the same route — "generate my report" for SALES/STAFF, and
-// "generate a report for the business (or for user X)" for ADMIN/MANAGER/
-// ACCOUNTANT — and the scoping rule lives in one place instead of being
-// re-implemented per page.
+
 import { Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AppError } from "../utils/appError";
@@ -84,9 +63,10 @@ function resolveRange(
 
 // Resolves the effective userId scope for the request, per the role rule
 // described above. Returns undefined for an org-wide (no-filter) report.
-function resolveUserScope(
-  req: AuthRequest,
-): { userId?: string; scope: "self" | "user" | "org" } {
+function resolveUserScope(req: AuthRequest): {
+  userId?: string;
+  scope: "self" | "user" | "org";
+} {
   const role = req.user!.role;
   const requested = (req.query.userId as string | undefined)?.trim();
 
@@ -101,7 +81,10 @@ function resolveUserScope(
 
 // Reads & clamps page/limit query params shared by every paginated section.
 function resolvePagination(req: AuthRequest): { page: number; limit: number } {
-  const page = Math.max(1, parseInt((req.query.page as string) || "1", 10) || 1);
+  const page = Math.max(
+    1,
+    parseInt((req.query.page as string) || "1", 10) || 1,
+  );
   const limit = Math.min(
     // 100 covers normal on-screen paging; the PDF export requests a single
     // large page (see reports/page.tsx) instead of looping, so the ceiling
@@ -125,6 +108,16 @@ export const generateReport = async (
     const interval = ((req.query.interval as string) || "month") as Interval;
     const { from, to, sessionId } = req.query as Record<string, string>;
     const { page, limit } = resolvePagination(req);
+
+    // Stock-movement source filter — "all" (default), "online", or "pos".
+    // Only meaningful for type=stock; ignored by every other tab.
+    const source = ((req.query.source as string) || "all") as
+      | "all"
+      | "online"
+      | "pos";
+    if (!["all", "online", "pos"].includes(source)) {
+      throw new AppError('source must be "all", "online", or "pos"', 400);
+    }
 
     const { userId, scope } = resolveUserScope(req);
 
@@ -165,7 +158,13 @@ export const generateReport = async (
     for (const t of types) {
       switch (t) {
         case "stock":
-          sections.stock = await buildStockSection(dateWhere, userId, page, limit);
+          sections.stock = await buildStockSection(
+            dateWhere,
+            userId,
+            page,
+            limit,
+            source,
+          );
           break;
         case "stock-approvals":
           sections.stockApprovals = await buildApprovalsSection(
@@ -234,11 +233,15 @@ async function batchUserNames(ids: (string | undefined | null)[]) {
   >;
 }
 
+const ONLINE_LOG_TYPES = ["ONLINE_SALE", "ONLINE_RETURN"];
+const POS_LOG_TYPES = ["POS_SALE", "RETURN"];
+
 async function buildStockSection(
   dateWhere: { gte: Date; lte: Date },
   userId: string | undefined,
   page: number,
   limit: number,
+  source: "all" | "online" | "pos" = "all",
 ) {
   // InventoryLog carries `performedBy` for anything logged after the
   // attribution fix; older rows only have it encoded in `reference`
@@ -248,6 +251,11 @@ async function buildStockSection(
   if (userId) {
     where.OR = [{ performedBy: userId }, { reference: { contains: userId } }];
   }
+  // Sales-channel filter — online orders log ONLINE_SALE/ONLINE_RETURN,
+  // POS sales log POS_SALE/RETURN. "all" (default) applies no extra filter,
+  // so manual adjustments/purchases/expiry entries still show up too.
+  if (source === "online") where.type = { in: ONLINE_LOG_TYPES };
+  if (source === "pos") where.type = { in: POS_LOG_TYPES };
 
   const [total, logs, byTypeRaw] = await Promise.all([
     prisma.inventoryLog.count({ where }),
@@ -301,6 +309,7 @@ async function buildStockSection(
 
   return {
     totalMovements: total,
+    source,
     byType,
     entries,
     pagination: {
@@ -451,7 +460,11 @@ async function buildActivitySection(
       skip: (page - 1) * limit,
       take: limit,
     }),
-    prisma.activityLog.groupBy({ by: ["action"], where, _count: { _all: true } }),
+    prisma.activityLog.groupBy({
+      by: ["action"],
+      where,
+      _count: { _all: true },
+    }),
   ]);
 
   const byAction: Record<string, number> = {};

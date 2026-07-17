@@ -18,14 +18,11 @@ const createPrismaClient = () => {
       },
     },
   });
-
-  // Verify connection on startup with a clear log
   client
     .$connect()
     .then(() => console.log("✅ Database connected successfully"))
     .catch((err: Error) => {
       console.error("❌ Database connection failed:", err.message);
-      process.exit(1);
     });
 
   return client;

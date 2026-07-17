@@ -45,11 +45,13 @@ export async function deductStockForOrder(
       await tx.inventoryLog.create({
         data: {
           productId: item.productId,
-          type: "SALE",
+          // Distinct from POS's "POS_SALE" so the stock-movement report can
+          // filter/group by sales channel unambiguously.
+          type: "ONLINE_SALE",
           quantity: -item.quantity,
           previousQty: product.stockQuantity,
           newQty: product.stockQuantity - item.quantity,
-          reason: "Online order payment confirmed",
+          reason: "Online order",
           reference: order.orderNumber,
           performedBy: performedBy?.id,
           performedByName: performedBy?.name || "System",
@@ -98,11 +100,13 @@ export async function restoreStockForOrder(
       await tx.inventoryLog.create({
         data: {
           productId: item.productId,
-          type: "RETURN",
+          // Distinct from POS's "RETURN" so the stock-movement report can
+          // filter/group by sales channel unambiguously.
+          type: "ONLINE_RETURN",
           quantity: item.quantity,
           previousQty: product.stockQuantity,
           newQty: product.stockQuantity + item.quantity,
-          reason,
+          reason: `Online order — ${reason}`,
           reference: order.orderNumber,
           performedBy: performedBy?.id,
           performedByName: performedBy?.name || "System",
