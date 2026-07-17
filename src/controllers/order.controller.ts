@@ -31,7 +31,8 @@ export const getOrders = async (
       endDate,
     } = req.query;
     const skip = (Number(page) - 1) * Number(limit);
-    const isAdmin = req.user?.role === "ADMIN" || req.user?.role === "STAFF";
+    // Any staff-side role (everything except CUSTOMER) can see all orders.
+    const isAdmin = req.user?.role !== "CUSTOMER";
 
     const where: any = {};
     if (!isAdmin) where.userId = req.user?.userId;
@@ -94,7 +95,8 @@ export const getOrder = async (
 ) => {
   try {
     const id = req.params.id as string; // ✅ fix: lines 68 (id & orderNumber)
-    const isAdmin = req.user?.role === "ADMIN" || req.user?.role === "STAFF";
+    // Any staff-side role (everything except CUSTOMER) can see all orders.
+    const isAdmin = req.user?.role !== "CUSTOMER";
 
     const order = await prisma.order.findFirst({
       where: { OR: [{ id }, { orderNumber: id }] },
