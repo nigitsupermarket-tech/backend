@@ -8,7 +8,11 @@ import {
   submitProofOfPayment,
   confirmBankTransfer,
 } from "../controllers/payment.controller";
-import { protect, restrictTo } from "../middlewares/auth.middleware";
+import {
+  protect,
+  restrictTo,
+  staffOrAdmin,
+} from "../middlewares/auth.middleware";
 
 const router = Router();
 
@@ -37,7 +41,13 @@ router.post("/initialize", protect, initializePayment);
 router.post("/bank-transfer/notify", protect, notifyBankTransfer);
 router.post("/bank-transfer/proof", protect, submitProofOfPayment);
 
-// ── Staff / Admin only ────────────────────────────────────────────────────────
-router.post("/bank-transfer/confirm", protect, confirmBankTransfer);
+// ── Staff / Admin only (ADMIN, STAFF, SALES, MANAGER — same as order
+//    status/tracking updates; ACCOUNTANT is view-only and excluded) ──────────
+router.post(
+  "/bank-transfer/confirm",
+  protect,
+  staffOrAdmin,
+  confirmBankTransfer,
+);
 
 export default router;

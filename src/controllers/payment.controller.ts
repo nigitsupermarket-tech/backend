@@ -368,10 +368,6 @@ export const confirmBankTransfer = async (
   next: NextFunction,
 ) => {
   try {
-    const role = req.user?.role;
-    if (role !== "ADMIN" && role !== "STAFF")
-      throw new AppError("Only staff can confirm bank transfers", 403);
-
     const { orderId, notes } = req.body;
 
     const order = await prisma.order.findUnique({ where: { id: orderId } });
