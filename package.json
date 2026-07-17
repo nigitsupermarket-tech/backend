@@ -5,6 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "nodemon src/server.ts",
+    "postinstall": "prisma generate",
     "build": "prisma generate && tsc",
     "vercel-build": "prisma generate && tsc",
     "start": "node dist/server.js",
