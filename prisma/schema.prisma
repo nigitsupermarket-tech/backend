@@ -1,6 +1,4 @@
 // prisma/schema.prisma
-// GROCERY SUPERMARKET EDITION — Port Harcourt, Nigeria
-// Updated: Grocery product details, POS system, full shipping logic, promotions
 
 generator client {
   provider      = "prisma-client-js"

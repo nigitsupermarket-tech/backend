@@ -11,9 +11,11 @@
     "start": "node dist/server.js",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
+    "postprisma:push": "npm run fix-cart-indexes",
     "prisma:studio": "prisma studio",
     "prisma:seed": "ts-node prisma/seed.ts",
-    "backfill:order-stock": "ts-node scripts/backfill-order-stock.ts"
+    "backfill:order-stock": "ts-node scripts/backfill-order-stock.ts",
+    "fix-cart-indexes": "ts-node scripts/fix-cart-indexes.ts"
   },
   "keywords": [
     "ecommerce",
@@ -26,6 +28,7 @@
     "@prisma/client": "^6.2.0",
     "@types/quill": "^2.0.14",
     "axios": "^1.7.9",
+    "basic-auth": "^2.0.1",
     "bcryptjs": "^2.4.3",
     "cloudinary": "^2.6.1",
     "cookie-parser": "^1.4.7",

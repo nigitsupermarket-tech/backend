@@ -6,6 +6,24 @@ import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
 
+const IS_PROD = process.env.NODE_ENV === "production";
+
+// Guest cart identity lives entirely in this cookie (there's no bearer-token
+// equivalent for guests). Frontend and backend are on different domains in
+// production (e.g. Vercel + a separate API host), which makes this a
+// cross-site request. A cross-site cookie MUST be `secure: true` and
+// `sameSite: "none"` or the browser will accept the Set-Cookie but then
+// silently refuse to send it back on the next request — every subsequent
+// call looks like a brand-new guest, so items never accumulate and a
+// refreshed page shows an empty cart. `sameSite: "lax"` (the previous
+// setting) only works for same-site deployments.
+const CART_SESSION_COOKIE_OPTIONS = {
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+  httpOnly: true,
+  secure: IS_PROD,
+  sameSite: (IS_PROD ? "none" : "lax") as "none" | "lax",
+};
+
 // ── helper: find-or-create cart safely ───────────────────────────────────────
 async function findOrCreateCart(
   userId: string | undefined,
@@ -23,8 +41,16 @@ async function findOrCreateCart(
     return cart;
   } catch (err: any) {
     if (err?.code === "P2002" || err?.code === 11000) {
-      const existing = await prisma.cart.findFirst({ where });
-      if (existing) return existing;
+      // Someone else created this exact cart a moment ago (double-click,
+      // two tabs, etc). Re-read it — retry once with a brief delay in case
+      // of read-after-write lag, then surface the error if it genuinely
+      // isn't there (which now indicates a real problem, not the old
+      // structural index bug).
+      for (const delayMs of [0, 150]) {
+        if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+        const existing = await prisma.cart.findFirst({ where });
+        if (existing) return existing;
+      }
     }
     throw err;
   }
@@ -109,11 +135,7 @@ export const addToCart = async (
     // Generate session cookie for guests
     if (!userId && !sessionId) {
       sessionId = `guest_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      res.cookie("cartSession", sessionId, {
-        maxAge: 7 * 24 * 60 * 60 * 1000,
-        httpOnly: true,
-        sameSite: "lax",
-      });
+      res.cookie("cartSession", sessionId, CART_SESSION_COOKIE_OPTIONS);
     }
 
     const product = await prisma.product.findUnique({

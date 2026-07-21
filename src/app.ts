@@ -1,7 +1,6 @@
 // backend/src/app.ts
 import express, { Application, Request, Response, NextFunction } from "express";
 import cors from "cors";
-import morgan from "morgan";
 import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
 import prisma from "./config/database";
@@ -40,6 +39,28 @@ import { notFound } from "./middlewares/notFound";
 
 // Load environment variables
 dotenv.config();
+
+// ── Defensive request-logger loader ─────────────────────────────────────────
+// A static `import morgan from "morgan"` gets executed the moment this
+// module loads, before any try/catch can run — so if morgan (or one of its
+// OWN dependencies, e.g. "basic-auth") is ever missing from the deployed
+// bundle, the entire function crashes on every single request, regardless
+// of whether logging is actually reachable at runtime. A lazy require()
+// inside try/catch can actually be caught, so a broken/missing logging
+// dependency degrades to "no access logs" instead of "the whole API is down".
+function morganMiddleware(format: "dev" | "combined") {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const morgan = require("morgan");
+    return morgan(format);
+  } catch (err) {
+    console.error(
+      `[startup] morgan unavailable, request logging disabled:`,
+      err,
+    );
+    return (_req: Request, _res: Response, next: NextFunction) => next();
+  }
+}
 
 const app: Application = express();
 
@@ -87,9 +108,9 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(cookieParser());
 
 if (process.env.NODE_ENV === "development") {
-  app.use(morgan("dev"));
+  app.use(morganMiddleware("dev"));
 } else {
-  app.use(morgan("combined"));
+  app.use(morganMiddleware("combined"));
 }
 
 // ============================================
