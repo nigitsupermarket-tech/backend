@@ -109,6 +109,10 @@ export const generateReport = async (
     const { from, to, sessionId } = req.query as Record<string, string>;
     const { page, limit } = resolvePagination(req);
 
+    // Product search — filters the stock-movement and stock-approvals
+    // tabs to a single product by name or SKU. Ignored by every other tab.
+    const product = ((req.query.product as string) || "").trim();
+
     // Stock-movement source filter — "all" (default), "online", or "pos".
     // Only meaningful for type=stock; ignored by every other tab.
     const source = ((req.query.source as string) || "all") as
@@ -164,6 +168,7 @@ export const generateReport = async (
             page,
             limit,
             source,
+            product,
           );
           break;
         case "stock-approvals":
@@ -172,6 +177,7 @@ export const generateReport = async (
             userId,
             page,
             limit,
+            product,
           );
           break;
         case "sales":
@@ -242,15 +248,33 @@ async function buildStockSection(
   page: number,
   limit: number,
   source: "all" | "online" | "pos" = "all",
+  product?: string,
 ) {
   // InventoryLog carries `performedBy` for anything logged after the
   // attribution fix; older rows only have it encoded in `reference`
   // (e.g. "admin:<userId>" or "approval:<requestId>"), so a per-user
   // filter has to match either shape.
   const where: any = { createdAt: dateWhere };
+  // userId and product each need their own OR clause (match performedBy OR
+  // reference; match product name OR sku) — nesting both under a single
+  // top-level `where.OR` would only require ONE of the four conditions to
+  // match instead of requiring both filters independently, so each goes in
+  // its own AND branch instead.
+  const andConditions: any[] = [];
   if (userId) {
-    where.OR = [{ performedBy: userId }, { reference: { contains: userId } }];
+    andConditions.push({
+      OR: [{ performedBy: userId }, { reference: { contains: userId } }],
+    });
   }
+  if (product) {
+    andConditions.push({
+      OR: [
+        { product: { name: { contains: product, mode: "insensitive" } } },
+        { product: { sku: { contains: product, mode: "insensitive" } } },
+      ],
+    });
+  }
+  if (andConditions.length > 0) where.AND = andConditions;
   // Sales-channel filter — online orders log ONLINE_SALE/ONLINE_RETURN,
   // POS sales log POS_SALE/RETURN. "all" (default) applies no extra filter,
   // so manual adjustments/purchases/expiry entries still show up too.
@@ -310,6 +334,7 @@ async function buildStockSection(
   return {
     totalMovements: total,
     source,
+    product: product || null,
     byType,
     entries,
     pagination: {
@@ -326,9 +351,16 @@ async function buildApprovalsSection(
   userId: string | undefined,
   page: number,
   limit: number,
+  product?: string,
 ) {
   const where: any = { createdAt: dateWhere };
   if (userId) where.requestedBy = userId;
+  if (product) {
+    where.OR = [
+      { productName: { contains: product, mode: "insensitive" } },
+      { productSku: { contains: product, mode: "insensitive" } },
+    ];
+  }
 
   const [total, requests, statusCounts] = await Promise.all([
     prisma.stockApprovalRequest.count({ where }),

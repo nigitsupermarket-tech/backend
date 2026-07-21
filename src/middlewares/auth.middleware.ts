@@ -61,12 +61,6 @@ export const salesOrAdmin = restrictTo("ADMIN", "SALES");
 // that MANAGER is allowed into (but regular STAFF/SALES are not).
 export const adminOrManager = restrictTo("ADMIN", "MANAGER");
 
-// User management — ADMIN, MANAGER, and STAFF only. SALES and ACCOUNTANT
-// never get a seat in user management; each role's actual capabilities
-// within it (who they can see/upgrade/demote) are scoped further in
-// user.controller.ts via backend/src/utils/roleHierarchy.ts.
-export const userManagementAccess = restrictTo("ADMIN", "MANAGER", "STAFF");
-
 // Finance/accounting routes — ADMIN, MANAGER, and the new ACCOUNTANT role.
 // ACCOUNTANT owns the finance dashboard (payments, reconciliation, reports)
 // but is never given POS/inventory write access.
