@@ -4,6 +4,12 @@ import prisma from "../config/database";
 import { AppError, NotFoundError, ConflictError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
 import { log as logActivity } from "../utils/activityLogger";
+import {
+  canAssignRole,
+  canViewRole,
+  rolesAbove,
+  USER_MANAGEMENT_ROLES,
+} from "../utils/roleHierarchy";
 
 export const getUsers = async (
   req: AuthRequest,
@@ -22,14 +28,18 @@ export const getUsers = async (
       ];
     }
 
-    // MANAGER can see/manage everyone except ADMIN accounts — they should
-    // never see admin users in user management.
-    if (req.user?.role === "MANAGER") {
-      if (where.role === "ADMIN") {
-        // Explicitly asked for admins — return empty rather than leaking them
+    // Hierarchy-scoped visibility: nobody sees roles more senior than
+    // themselves (ADMIN is unrestricted). STAFF never sees MANAGER/ADMIN;
+    // MANAGER never sees ADMIN. Peers and anything below remain visible.
+    const actorRole = req.user?.role || "";
+    const hiddenRoles = rolesAbove(actorRole);
+    if (hiddenRoles.length > 0) {
+      if (where.role && hiddenRoles.includes(where.role)) {
+        // Explicitly asked for a role they can't see — return empty rather
+        // than leaking it.
         where.role = "__NONE__";
       } else if (!where.role) {
-        where.role = { not: "ADMIN" };
+        where.role = { notIn: hiddenRoles };
       }
     }
 
@@ -81,11 +91,10 @@ export const getUser = async (
 ) => {
   try {
     const id = req.params.id as string;
+    const actorRole = req.user?.role || "";
 
-    const isStaffSide = ["ADMIN", "STAFF", "SALES", "MANAGER"].includes(
-      req.user?.role || "",
-    );
-    if (!isStaffSide && req.user?.userId !== id)
+    const isManagementRole = USER_MANAGEMENT_ROLES.includes(actorRole);
+    if (!isManagementRole && req.user?.userId !== id)
       throw new AppError("Not authorized", 403);
 
     const user = await prisma.user.findUnique({
@@ -118,7 +127,13 @@ export const getUser = async (
       },
     });
     if (!user) throw new NotFoundError("User not found");
-    if (req.user?.role === "MANAGER" && user.role === "ADMIN") {
+    // Hierarchy-scoped visibility: STAFF can't view MANAGER/ADMIN accounts,
+    // MANAGER can't view ADMIN accounts, ADMIN can view anyone.
+    if (
+      isManagementRole &&
+      req.user?.userId !== id &&
+      !canViewRole(actorRole, user.role)
+    ) {
       throw new AppError("Not authorized", 403);
     }
 
@@ -135,10 +150,16 @@ export const createUser = async (
 ) => {
   try {
     const { name, email, phone, password, role } = req.body;
+    const assignedRole = role || "STAFF";
 
-    // MANAGER can create staff/sales/manager accounts, but never ADMIN.
-    if (req.user?.role === "MANAGER" && role === "ADMIN") {
-      throw new AppError("Managers cannot create admin accounts", 403);
+    // A brand-new account has no prior role, so this only checks the
+    // requested role against the actor's own rank — same rule as
+    // updateUser, just without a "current role" to compare.
+    if (!canAssignRole(req.user?.role || "", "CUSTOMER", assignedRole)) {
+      throw new AppError(
+        `You do not have permission to create a ${assignedRole} account`,
+        403,
+      );
     }
 
     const existing = await prisma.user.findUnique({ where: { email } });
@@ -153,7 +174,7 @@ export const createUser = async (
         email,
         phone,
         password: hashed,
-        role: role || "STAFF",
+        role: assignedRole,
         emailVerified: true,
       },
       select: {
@@ -171,7 +192,12 @@ export const createUser = async (
       action: "create user",
       entity: "user",
       entityId: user.id,
-      metadata: { name: user.name, email: user.email, role: user.role },
+      metadata: {
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        performedByRole: req.user?.role,
+      },
       req,
     });
 
@@ -192,12 +218,25 @@ export const updateUser = async (
 ) => {
   try {
     const id = req.params.id as string;
-
-    const isAdmin = req.user?.role === "ADMIN";
-    const isManager = req.user?.role === "MANAGER";
+    const actorRole = req.user?.role || "";
     const isSelf = req.user?.userId === id;
-    if (!isAdmin && !isManager && !isSelf)
+    const isManagementRole = USER_MANAGEMENT_ROLES.includes(actorRole);
+
+    if (!isManagementRole && !isSelf)
       throw new AppError("Not authorized", 403);
+
+    const target = await prisma.user.findUnique({
+      where: { id },
+      select: { role: true, name: true, email: true },
+    });
+    if (!target) throw new NotFoundError("User not found");
+
+    // A management-role actor editing someone else must be allowed to even
+    // SEE that account first (STAFF can't touch a MANAGER's record just
+    // because they hit the right URL).
+    if (isManagementRole && !isSelf && !canViewRole(actorRole, target.role)) {
+      throw new AppError("Not authorized", 403);
+    }
 
     const { name, phone, image, role, customerSegment } = req.body;
     const updates: any = {};
@@ -205,26 +244,34 @@ export const updateUser = async (
     if (phone) updates.phone = phone;
     if (image) updates.image = image;
 
-    // ── Role assignment ──────────────────────────────────────────────────
+    // ── Role assignment (upgrade/demote) ───────────────────────────────────
     // ADMIN: can assign any role to anyone.
-    // MANAGER: can assign any role EXCEPT "ADMIN", and cannot modify a user
-    //          who currently holds the ADMIN role (no demoting admins).
-    if (role && (isAdmin || isManager)) {
-      if (isManager) {
-        if (role === "ADMIN") {
-          throw new AppError("Managers cannot assign the ADMIN role", 403);
-        }
-        const target = await prisma.user.findUnique({
-          where: { id },
-          select: { role: true },
-        });
-        if (target?.role === "ADMIN") {
-          throw new AppError("Managers cannot modify an admin account", 403);
-        }
+    // MANAGER: can assign anything below MANAGER (STAFF, ACCOUNTANT, SALES,
+    //          CUSTOMER) to a target currently below MANAGER — never ADMIN,
+    //          never another MANAGER.
+    // STAFF:   can assign ACCOUNTANT/SALES/CUSTOMER to a target currently at
+    //          ACCOUNTANT/SALES/CUSTOMER — never STAFF, MANAGER, or ADMIN,
+    //          and never touches a target who already holds one of those.
+    // See backend/src/utils/roleHierarchy.ts for the shared rule.
+    let roleChange: { from: string; to: string } | null = null;
+    if (role && role !== target.role) {
+      if (!isManagementRole) {
+        throw new AppError(
+          "You do not have permission to change user roles",
+          403,
+        );
+      }
+      if (!canAssignRole(actorRole, target.role, role)) {
+        throw new AppError(
+          `${actorRole.charAt(0) + actorRole.slice(1).toLowerCase()}s cannot change a ${target.role} account to ${role}`,
+          403,
+        );
       }
       updates.role = role;
+      roleChange = { from: target.role, to: role };
     }
-    if (customerSegment && (isAdmin || isManager))
+
+    if (customerSegment && isManagementRole)
       updates.customerSegment = customerSegment;
 
     const user = await prisma.user.update({
@@ -241,12 +288,24 @@ export const updateUser = async (
       },
     });
 
+    // Always record what changed. Role changes get their own action name
+    // and explicit before/after values so the activity log doubles as an
+    // audit trail for who upgraded/demoted whom.
     logActivity({
       userId: req.user?.userId,
-      action: "update user",
+      action: roleChange ? "update user role" : "update user",
       entity: "user",
       entityId: user.id,
-      metadata: { changedFields: Object.keys(updates), targetName: user.name },
+      metadata: {
+        changedFields: Object.keys(updates),
+        targetName: user.name,
+        targetEmail: target.email,
+        performedByRole: actorRole,
+        ...(roleChange && {
+          roleChangedFrom: roleChange.from,
+          roleChangedTo: roleChange.to,
+        }),
+      },
       req,
     });
 
@@ -277,7 +336,12 @@ export const deleteUser = async (
       action: "delete user",
       entity: "user",
       entityId: id,
-      metadata: { name: user.name, email: user.email, role: user.role },
+      metadata: {
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        performedByRole: req.user?.role,
+      },
       req,
     });
 
