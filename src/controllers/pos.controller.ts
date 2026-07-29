@@ -4,6 +4,11 @@ import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
 import { log as logActivity } from "../utils/activityLogger";
+import {
+  findActiveVariation,
+  resolveVariationLine,
+  assertVariationStock,
+} from "../lib/productVariation";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -85,11 +90,19 @@ export const createPOSOrder = async (
     // phase from O(n × RTT) down to ~O(1 × RTT).
     const products = await Promise.all(
       items.map((item: any) =>
-        prisma.product.findUnique({ where: { id: item.productId } }),
+        prisma.product.findUnique({
+          where: { id: item.productId },
+          include: { variations: true },
+        }),
       ),
     );
 
     const validatedItems: any[] = [];
+    // What actually gets written to POSOrderItem. Built server-side (not the
+    // raw client `items`) so a selected variation's price/label/stock-mode
+    // always reflects the authoritative product record, never a stale or
+    // tampered client value.
+    const preparedItems: any[] = [];
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       const product = products[i];
@@ -98,17 +111,61 @@ export const createPOSOrder = async (
       if (product.status !== "ACTIVE") {
         throw new AppError(`${product.name} is not currently available`, 400);
       }
-      if (product.trackInventory && product.stockQuantity < item.quantity) {
-        // For scalable products, stockQuantity is in scale units (e.g. kg)
-        const unit = product.isScalable
-          ? ` ${product.scaleUnit || "unit"}`
-          : "";
-        throw new AppError(
-          `Insufficient stock for ${product.name} (available: ${product.stockQuantity}${unit})`,
-          400,
+
+      if (item.variationId) {
+        // ── Structured preset/variation line (e.g. "500g Pack") ──────────
+        const variation = findActiveVariation(product as any, item.variationId);
+        const packCount = item.quantity > 0 ? item.quantity : 1;
+        const resolved = resolveVariationLine(variation, packCount);
+        assertVariationStock(
+          product as any,
+          variation,
+          resolved,
+          product.allowBackorder,
         );
+
+        validatedItems.push({ product, item, variation, resolved });
+        preparedItems.push({
+          productId: item.productId,
+          productName: item.productName,
+          productSku: item.productSku,
+          barcode: item.barcode ?? (variation as any).barcode ?? null,
+          netWeight: item.netWeight ?? null,
+          scaleUnit: product.scaleUnit ?? null,
+          variationId: variation.id,
+          variationLabel: variation.label,
+          stockMode: resolved.stockMode,
+          quantity: resolved.packCount,
+          unitPrice: resolved.unitPrice,
+          subtotal: resolved.subtotal,
+          discountApplied: item.discountApplied ?? 0,
+        });
+      } else {
+        // ── Legacy fixed / free-form custom-weight line (unchanged) ──────
+        if (product.trackInventory && product.stockQuantity < item.quantity) {
+          // For scalable products, stockQuantity is in scale units (e.g. kg)
+          const unit = product.isScalable
+            ? ` ${product.scaleUnit || "unit"}`
+            : "";
+          throw new AppError(
+            `Insufficient stock for ${product.name} (available: ${product.stockQuantity}${unit})`,
+            400,
+          );
+        }
+        validatedItems.push({ product, item });
+        preparedItems.push({
+          productId: item.productId,
+          productName: item.productName,
+          productSku: item.productSku,
+          barcode: item.barcode ?? null,
+          netWeight: item.netWeight ?? null,
+          scaleUnit: item.scaleUnit ?? null,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice,
+          subtotal: item.subtotal,
+          discountApplied: item.discountApplied ?? 0,
+        });
       }
-      validatedItems.push({ product, item });
     }
 
     const posOrderNumber = generatePOSOrderNumber();
@@ -150,18 +207,7 @@ export const createPOSOrder = async (
             receiptNumber,
             completedAt: new Date(),
             items: {
-              create: items.map((item: any) => ({
-                productId: item.productId,
-                productName: item.productName,
-                productSku: item.productSku,
-                barcode: item.barcode ?? null,
-                netWeight: item.netWeight ?? null,
-                scaleUnit: item.scaleUnit ?? null,
-                quantity: item.quantity,
-                unitPrice: item.unitPrice,
-                subtotal: item.subtotal,
-                discountApplied: item.discountApplied ?? 0,
-              })),
+              create: preparedItems,
             },
           },
           include: { items: true },
@@ -173,8 +219,64 @@ export const createPOSOrder = async (
         await Promise.all(
           validatedItems
             .filter(({ product }) => product.trackInventory)
-            .map(({ product, item }) =>
-              Promise.all([
+            .map(({ product, item, variation, resolved }) => {
+              if (variation && resolved) {
+                if (resolved.stockMode === "DEDICATED") {
+                  // Dedicated stock — decrement the variation's own pack
+                  // count, completely independent of the shared pool.
+                  const prevQty = variation.stockQuantity ?? 0;
+                  return Promise.all([
+                    tx.productVariation.update({
+                      where: { id: variation.id },
+                      data: { stockQuantity: { decrement: resolved.packCount } },
+                    }),
+                    tx.inventoryLog.create({
+                      data: {
+                        productId: product.id,
+                        type: "POS_SALE",
+                        quantity: -resolved.packCount,
+                        previousQty: prevQty,
+                        newQty: prevQty - resolved.packCount,
+                        reason: `POS sale — ${variation.label}`,
+                        reference: posOrderNumber,
+                        variationId: variation.id,
+                        variationLabel: variation.label,
+                        stockMode: "DEDICATED",
+                        performedBy: staffId,
+                      },
+                    }),
+                  ]);
+                }
+                // Shared stock — deduct the equivalent base quantity (in
+                // scaleUnit) from the product's shared pool.
+                return Promise.all([
+                  tx.product.update({
+                    where: { id: product.id },
+                    data: {
+                      stockQuantity: { decrement: resolved.baseQty },
+                      salesCount: { increment: resolved.packCount },
+                    },
+                  }),
+                  tx.inventoryLog.create({
+                    data: {
+                      productId: product.id,
+                      type: "POS_SALE",
+                      quantity: -resolved.baseQty,
+                      previousQty: product.stockQuantity,
+                      newQty: product.stockQuantity - resolved.baseQty,
+                      reason: `POS sale — ${variation.label}`,
+                      reference: posOrderNumber,
+                      variationId: variation.id,
+                      variationLabel: variation.label,
+                      stockMode: "SHARED",
+                      performedBy: staffId,
+                    },
+                  }),
+                ]);
+              }
+
+              // Legacy fixed / free-form custom-weight line — unchanged.
+              return Promise.all([
                 tx.product.update({
                   where: { id: product.id },
                   data: {
@@ -194,8 +296,8 @@ export const createPOSOrder = async (
                     performedBy: staffId,
                   },
                 }),
-              ]),
-            ),
+              ]);
+            }),
         );
 
         if (discountCode) {
@@ -379,6 +481,19 @@ export const voidPOSOrder = async (
       : [];
     const productMap = new Map(products.map((p) => [p.id, p]));
 
+    // For variation lines we need the variation's own quantity-per-pack (to
+    // convert a pack count back into a shared-pool base quantity) and its
+    // current dedicated stock (if any) to restore correctly.
+    const variationIds = orderItems
+      .filter((i) => i.variationId)
+      .map((i) => i.variationId as string);
+    const variations = variationIds.length
+      ? await prisma.productVariation.findMany({
+          where: { id: { in: variationIds } },
+        })
+      : [];
+    const variationMap = new Map(variations.map((v) => [v.id, v]));
+
     await prisma.$transaction(
       async (tx) => {
         // 1. Mark voided
@@ -398,6 +513,68 @@ export const voidPOSOrder = async (
             orderItems.map((item) => {
               const product = productMap.get(item.productId);
               if (!product) return Promise.resolve();
+
+              if (item.variationId) {
+                const variation = variationMap.get(item.variationId);
+                const label = item.variationLabel || variation?.label || "variation";
+
+                if (item.stockMode === "DEDICATED" && variation) {
+                  const prevQty = variation.stockQuantity ?? 0;
+                  return Promise.all([
+                    tx.productVariation.update({
+                      where: { id: item.variationId as string },
+                      data: { stockQuantity: { increment: item.quantity } },
+                    }),
+                    tx.inventoryLog.create({
+                      data: {
+                        productId: item.productId,
+                        type: "RETURN",
+                        quantity: item.quantity,
+                        previousQty: prevQty,
+                        newQty: prevQty + item.quantity,
+                        reason: `POS void: ${reason || "no reason"} — ${label}`,
+                        reference: order.posOrderNumber,
+                        variationId: item.variationId,
+                        variationLabel: label,
+                        stockMode: "DEDICATED",
+                        performedBy: req.user?.userId,
+                      },
+                    }),
+                  ]);
+                }
+
+                // SHARED mode — item.quantity is a PACK COUNT, so convert
+                // back to the base scaleUnit amount before restoring.
+                const baseQty = variation
+                  ? variation.quantity * item.quantity
+                  : item.quantity;
+                return Promise.all([
+                  tx.product.update({
+                    where: { id: item.productId },
+                    data: {
+                      stockQuantity: { increment: baseQty },
+                      salesCount: { decrement: item.quantity },
+                    },
+                  }),
+                  tx.inventoryLog.create({
+                    data: {
+                      productId: item.productId,
+                      type: "RETURN",
+                      quantity: baseQty,
+                      previousQty: product.stockQuantity,
+                      newQty: product.stockQuantity + baseQty,
+                      reason: `POS void: ${reason || "no reason"} — ${label}`,
+                      reference: order.posOrderNumber,
+                      variationId: item.variationId,
+                      variationLabel: label,
+                      stockMode: "SHARED",
+                      performedBy: req.user?.userId,
+                    },
+                  }),
+                ]);
+              }
+
+              // Legacy fixed / free-form custom-weight line — unchanged.
               return Promise.all([
                 tx.product.update({
                   where: { id: item.productId },
@@ -1001,9 +1178,34 @@ export const resumePOSOrder = async (
     for (const item of order.items) {
       const product = await prisma.product.findUnique({
         where: { id: item.productId },
+        include: { variations: true },
       });
       if (!product) continue;
-      if (product.trackInventory && product.stockQuantity < item.quantity) {
+      if (!product.trackInventory) continue;
+
+      if (item.variationId) {
+        const variation = product.variations.find((v) => v.id === item.variationId);
+        if (!variation || !variation.isActive) {
+          throw new AppError(
+            `Stock changed while order was suspended — "${item.variationLabel || "an item"}" for ${product.name} is no longer available.`,
+            400,
+          );
+        }
+        const dedicated = variation.stockQuantity !== null;
+        const available = dedicated
+          ? (variation.stockQuantity as number)
+          : product.stockQuantity;
+        const required = dedicated ? item.quantity : variation.quantity * item.quantity;
+        if (available < required) {
+          throw new AppError(
+            `Stock changed while order was suspended — ${product.name} (${variation.label}) now only has ${available} available.`,
+            400,
+          );
+        }
+        continue;
+      }
+
+      if (product.stockQuantity < item.quantity) {
         const unit = product.isScalable
           ? ` ${product.scaleUnit || "unit"}`
           : "";
@@ -1115,6 +1317,8 @@ export const holdNewPOSOrder = async (
             barcode: item.barcode ?? null,
             netWeight: item.netWeight ?? null,
             scaleUnit: item.scaleUnit ?? null,
+            variationId: item.variationId ?? null,
+            variationLabel: item.variationLabel ?? null,
             quantity: item.quantity,
             unitPrice: item.unitPrice,
             subtotal: item.subtotal,

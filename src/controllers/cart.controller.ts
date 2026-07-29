@@ -5,6 +5,11 @@ import { Prisma } from "@prisma/client";
 import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import {
+  findActiveVariation,
+  resolveVariationLine,
+  assertVariationStock,
+} from "../lib/productVariation";
 
 const IS_PROD = process.env.NODE_ENV === "production";
 
@@ -92,6 +97,7 @@ export const getCart = async (
                 stockQuantity: true,
                 status: true,
                 sku: true,
+                variations: true,
               },
             },
           },
@@ -128,7 +134,7 @@ export const addToCart = async (
   next: NextFunction,
 ) => {
   try {
-    const { productId, quantity = 1 } = req.body;
+    const { productId, quantity = 1, variationId } = req.body;
     const userId = req.user?.userId;
     let sessionId = req.cookies.cartSession;
 
@@ -140,41 +146,67 @@ export const addToCart = async (
 
     const product = await prisma.product.findUnique({
       where: { id: productId },
+      include: { variations: true },
     });
     if (!product) throw new NotFoundError("Product not found");
     if (product.status !== "ACTIVE")
       throw new AppError("This product is currently unavailable", 400);
 
-    // ── Stock check ──────────────────────────────────────────────────────────
-    // For scalable products: stockQuantity is in scale units (e.g. kg).
-    // quantity from request is also in scale units.
-    // For fixed products: both are whole integers.
-    if (!product.allowBackorder && product.stockQuantity < quantity) {
-      if (product.stockQuantity === 0) {
-        throw new AppError(`${product.name} is out of stock`, 400);
-      }
-      const unit = product.isScalable ? product.scaleUnit || "unit" : "unit";
-      const available = product.isScalable
-        ? `${product.stockQuantity} ${unit}`
-        : `${product.stockQuantity} unit${product.stockQuantity === 1 ? "" : "s"}`;
-      throw new AppError(`Only ${available} of ${product.name} available`, 400);
-    }
+    let itemPrice: number;
+    let variationLabel: string | null = null;
+    let effectiveQuantity = quantity;
 
-    // ── Price: use pricePerUnit for scalable, price for fixed ────────────────
-    const itemPrice =
-      product.isScalable && product.pricePerUnit
-        ? product.pricePerUnit
-        : product.price;
+    if (variationId) {
+      // ── Structured preset/variation (e.g. "500g Pack") ──────────────────
+      const variation = findActiveVariation(product as any, variationId);
+      const resolved = resolveVariationLine(variation, quantity);
+      assertVariationStock(
+        product as any,
+        variation,
+        resolved,
+        product.allowBackorder,
+      );
+      itemPrice = resolved.unitPrice;
+      variationLabel = resolved.variationLabel;
+      effectiveQuantity = resolved.packCount;
+    } else {
+      // ── Legacy fixed / free-form custom-weight entry (unchanged) ────────
+      if (!product.allowBackorder && product.stockQuantity < quantity) {
+        if (product.stockQuantity === 0) {
+          throw new AppError(`${product.name} is out of stock`, 400);
+        }
+        const unit = product.isScalable ? product.scaleUnit || "unit" : "unit";
+        const available = product.isScalable
+          ? `${product.stockQuantity} ${unit}`
+          : `${product.stockQuantity} unit${product.stockQuantity === 1 ? "" : "s"}`;
+        throw new AppError(`Only ${available} of ${product.name} available`, 400);
+      }
+      itemPrice =
+        product.isScalable && product.pricePerUnit
+          ? product.pricePerUnit
+          : product.price;
+    }
 
     const cart = await findOrCreateCart(userId, sessionId);
 
+    // Different variations of the same product are separate cart lines —
+    // match on productId AND variationId (both null for legacy items).
     const existingItem = await prisma.cartItem.findFirst({
-      where: { cartId: cart.id, productId },
+      where: { cartId: cart.id, productId, variationId: variationId ?? null },
     });
 
     if (existingItem) {
-      const newQty = existingItem.quantity + quantity;
-      if (!product.allowBackorder && product.stockQuantity < newQty) {
+      const newQty = existingItem.quantity + effectiveQuantity;
+      if (variationId) {
+        const variation = findActiveVariation(product as any, variationId);
+        const resolved = resolveVariationLine(variation, newQty);
+        assertVariationStock(
+          product as any,
+          variation,
+          resolved,
+          product.allowBackorder,
+        );
+      } else if (!product.allowBackorder && product.stockQuantity < newQty) {
         const available = product.stockQuantity - existingItem.quantity;
         const unit = product.isScalable
           ? product.scaleUnit || "unit"
@@ -198,7 +230,14 @@ export const addToCart = async (
       });
     } else {
       await prisma.cartItem.create({
-        data: { cartId: cart.id, productId, quantity, price: itemPrice },
+        data: {
+          cartId: cart.id,
+          productId,
+          quantity: effectiveQuantity,
+          price: itemPrice,
+          variationId: variationId ?? null,
+          variationLabel,
+        },
       });
     }
 
@@ -217,6 +256,7 @@ export const addToCart = async (
                 isScalable: true,
                 scaleUnit: true,
                 stockQuantity: true,
+                variations: true,
               },
             },
           },
@@ -252,10 +292,31 @@ export const updateCartItem = async (
 
     const item = await prisma.cartItem.findUnique({
       where: { id: itemId },
-      include: { product: true },
+      include: { product: { include: { variations: true } } },
     });
     if (!item) throw new NotFoundError("Cart item not found");
 
+    if (item.variationId) {
+      // ── Structured preset/variation — quantity is a PACK COUNT ──────────
+      const variation = findActiveVariation(item.product as any, item.variationId);
+      if (quantity < 1) {
+        throw new AppError(`Minimum quantity is 1 ${variation.label}`, 400);
+      }
+      const resolved = resolveVariationLine(variation, quantity);
+      assertVariationStock(
+        item.product as any,
+        variation,
+        resolved,
+        item.product.allowBackorder,
+      );
+      await prisma.cartItem.update({
+        where: { id: itemId },
+        data: { quantity: resolved.packCount, price: resolved.unitPrice },
+      });
+      return res.status(200).json({ success: true, message: "Cart updated" });
+    }
+
+    // ── Legacy fixed / free-form custom-weight entry (unchanged) ──────────
     // Minimum: for scalable products use minOrderQty, for fixed use 1
     const minQty = item.product.isScalable
       ? item.product.minOrderQty || item.product.scaleStep || 0.1

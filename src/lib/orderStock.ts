@@ -30,11 +30,53 @@ export async function deductStockForOrder(
   });
   const productMap = new Map(products.map((p) => [p.id, p]));
 
+  // Variation items need their own record fetched to know current dedicated
+  // stock (previousQty) before decrementing.
+  const variationIds = order.items
+    .filter((i) => i.variationId)
+    .map((i) => i.variationId as string);
+  const variations = variationIds.length
+    ? await prisma.productVariation.findMany({
+        where: { id: { in: variationIds } },
+      })
+    : [];
+  const variationMap = new Map(variations.map((v) => [v.id, v]));
+
   await prisma.$transaction(async (tx) => {
     for (const item of order.items) {
       const product = productMap.get(item.productId);
       if (!product || !product.trackInventory) continue; // don't track untracked products
 
+      if (item.variationId && item.stockMode === "DEDICATED") {
+        const variation = variationMap.get(item.variationId);
+        const prevQty = variation?.stockQuantity ?? 0;
+        await tx.productVariation.update({
+          where: { id: item.variationId },
+          data: { stockQuantity: { decrement: item.quantity } },
+        });
+        await tx.inventoryLog.create({
+          data: {
+            productId: item.productId,
+            type: "ONLINE_SALE",
+            quantity: -item.quantity,
+            previousQty: prevQty,
+            newQty: prevQty - item.quantity,
+            reason: `Online order — ${item.variationLabel || "variation"}`,
+            reference: order.orderNumber,
+            variationId: item.variationId,
+            variationLabel: item.variationLabel,
+            stockMode: "DEDICATED",
+            performedBy: performedBy?.id,
+            performedByName: performedBy?.name || "System",
+          },
+        });
+        continue;
+      }
+
+      // Shared pool — for variation items this is already the base qty
+      // (item.quantity was resolved as packCount × variation.quantity at
+      // order-creation time when stockMode is SHARED), for legacy items
+      // it's the raw scale/unit quantity, both deduct directly.
       await tx.product.update({
         where: { id: item.productId },
         data: {
@@ -51,8 +93,13 @@ export async function deductStockForOrder(
           quantity: -item.quantity,
           previousQty: product.stockQuantity,
           newQty: product.stockQuantity - item.quantity,
-          reason: "Online order",
+          reason: item.variationLabel
+            ? `Online order — ${item.variationLabel}`
+            : "Online order",
           reference: order.orderNumber,
+          variationId: item.variationId ?? undefined,
+          variationLabel: item.variationLabel ?? undefined,
+          stockMode: item.variationId ? "SHARED" : undefined,
           performedBy: performedBy?.id,
           performedByName: performedBy?.name || "System",
         },
@@ -85,10 +132,46 @@ export async function restoreStockForOrder(
   });
   const productMap = new Map(products.map((p) => [p.id, p]));
 
+  const variationIds = order.items
+    .filter((i) => i.variationId)
+    .map((i) => i.variationId as string);
+  const variations = variationIds.length
+    ? await prisma.productVariation.findMany({
+        where: { id: { in: variationIds } },
+      })
+    : [];
+  const variationMap = new Map(variations.map((v) => [v.id, v]));
+
   await prisma.$transaction(async (tx) => {
     for (const item of order.items) {
       const product = productMap.get(item.productId);
       if (!product || !product.trackInventory) continue;
+
+      if (item.variationId && item.stockMode === "DEDICATED") {
+        const variation = variationMap.get(item.variationId);
+        const prevQty = variation?.stockQuantity ?? 0;
+        await tx.productVariation.update({
+          where: { id: item.variationId },
+          data: { stockQuantity: { increment: item.quantity } },
+        });
+        await tx.inventoryLog.create({
+          data: {
+            productId: item.productId,
+            type: "ONLINE_RETURN",
+            quantity: item.quantity,
+            previousQty: prevQty,
+            newQty: prevQty + item.quantity,
+            reason: `Online order — ${reason} (${item.variationLabel || "variation"})`,
+            reference: order.orderNumber,
+            variationId: item.variationId,
+            variationLabel: item.variationLabel,
+            stockMode: "DEDICATED",
+            performedBy: performedBy?.id,
+            performedByName: performedBy?.name || "System",
+          },
+        });
+        continue;
+      }
 
       await tx.product.update({
         where: { id: item.productId },
@@ -106,8 +189,13 @@ export async function restoreStockForOrder(
           quantity: item.quantity,
           previousQty: product.stockQuantity,
           newQty: product.stockQuantity + item.quantity,
-          reason: `Online order — ${reason}`,
+          reason: item.variationLabel
+            ? `Online order — ${reason} (${item.variationLabel})`
+            : `Online order — ${reason}`,
           reference: order.orderNumber,
+          variationId: item.variationId ?? undefined,
+          variationLabel: item.variationLabel ?? undefined,
+          stockMode: item.variationId ? "SHARED" : undefined,
           performedBy: performedBy?.id,
           performedByName: performedBy?.name || "System",
         },

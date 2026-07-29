@@ -9,6 +9,11 @@ import {
   sendAdminNewOrderEmail,
 } from "../services/email.service";
 import { restoreStockForOrder } from "../lib/orderStock";
+import {
+  findActiveVariation,
+  resolveVariationLine,
+  assertVariationStock,
+} from "../lib/productVariation";
 
 const generateOrderNumber = () =>
   `ORD-${Date.now().toString().slice(-8)}-${Math.floor(Math.random() * 1000)
@@ -394,12 +399,53 @@ export const createOrder = async (
     for (const item of items) {
       const product = await prisma.product.findUnique({
         where: { id: item.productId },
+        include: { variations: true },
       });
       if (!product)
         throw new NotFoundError(`Product ${item.productId} not found`);
       if (product.status !== "ACTIVE")
         throw new AppError(`${product.name} is not available`, 400);
-      // ── Stock check ────────────────────────────────────────────────────────
+
+      if (item.variationId) {
+        // ── Structured preset/variation (e.g. "500g Pack") ──────────────
+        // Price and stock requirement always come from the server-side
+        // variation record — never from client-supplied values — so a
+        // stale price shown in an abandoned tab, or a tampered request,
+        // can't under-charge or over-sell a preset.
+        const variation = findActiveVariation(product as any, item.variationId);
+        const packCount = item.quantity > 0 ? item.quantity : 1;
+        const resolved = resolveVariationLine(variation, packCount);
+        assertVariationStock(
+          product as any,
+          variation,
+          resolved,
+          product.allowBackorder,
+        );
+
+        subtotal += resolved.subtotal;
+        totalWeight += (product.weight || 0) * resolved.baseQty;
+
+        categoryIds.push(product.categoryId);
+        productIds.push(product.id);
+
+        orderItems.push({
+          productId: product.id,
+          productName: product.name,
+          productSku: product.sku,
+          productImage: product.images[0] || null,
+          netWeight: product.netWeight || null,
+          scaleUnit: product.scaleUnit || null,
+          variationId: variation.id,
+          variationLabel: variation.label,
+          stockMode: resolved.stockMode,
+          quantity: resolved.packCount,
+          price: resolved.unitPrice,
+          subtotal: resolved.subtotal,
+        });
+        continue;
+      }
+
+      // ── Legacy fixed / free-form custom-weight line (unchanged) ────────
       // For scalable products, stockQuantity and item.quantity are both in
       // scale units (e.g. kg). For fixed products, both are whole integers.
       if (!product.allowBackorder && product.stockQuantity < item.quantity) {

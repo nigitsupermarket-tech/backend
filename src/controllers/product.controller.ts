@@ -8,6 +8,106 @@ import {
   deleteCloudinaryImage,
 } from "../lib/cloudinary";
 
+// ── Product variation helpers ──────────────────────────────────────────────
+// Shared by createProduct/updateProduct to turn raw request-body variation
+// objects into safe Prisma input, and to make sure a barcode always
+// resolves to exactly one scannable thing (a product OR one variation).
+
+interface VariationInput {
+  id?: string;
+  label: string;
+  quantity: number;
+  price: number;
+  compareAtPrice?: number | null;
+  barcode?: string | null;
+  sku?: string | null;
+  stockQuantity?: number | null; // null/undefined = shared stock mode
+  isDefault?: boolean;
+  isActive?: boolean;
+  sortOrder?: number;
+}
+
+function toVariationCreateInput(v: VariationInput) {
+  if (!v.label || !v.label.trim()) {
+    throw new AppError("Every variation needs a label", 400);
+  }
+  if (!(v.quantity > 0)) {
+    throw new AppError(`Variation "${v.label}" needs a quantity > 0`, 400);
+  }
+  if (!(v.price >= 0)) {
+    throw new AppError(`Variation "${v.label}" needs a valid price`, 400);
+  }
+  return {
+    label: v.label.trim(),
+    quantity: Number(v.quantity),
+    price: Number(v.price),
+    compareAtPrice:
+      v.compareAtPrice !== undefined && v.compareAtPrice !== null
+        ? Number(v.compareAtPrice)
+        : null,
+    barcode: v.barcode?.trim() || null,
+    sku: v.sku?.trim() || null,
+    stockQuantity:
+      v.stockQuantity !== undefined && v.stockQuantity !== null
+        ? Number(v.stockQuantity)
+        : null,
+    isDefault: v.isDefault ?? false,
+    isActive: v.isActive ?? true,
+    sortOrder: v.sortOrder ?? 0,
+  };
+}
+
+/**
+ * Ensures none of the incoming variation barcodes collide with:
+ *  - another product's own barcode,
+ *  - another product's variation barcode,
+ *  - a duplicate within this same payload.
+ * `excludeProductId` lets updateProduct ignore the product's own existing
+ * records when re-validating on save.
+ */
+async function assertVariationBarcodesAvailable(
+  incoming: VariationInput[],
+  excludeProductId?: string,
+) {
+  const barcodes = incoming
+    .map((v) => v.barcode?.trim())
+    .filter((b): b is string => !!b);
+  if (barcodes.length === 0) return;
+
+  const dupes = barcodes.filter((b, i) => barcodes.indexOf(b) !== i);
+  if (dupes.length > 0) {
+    throw new AppError(
+      `Duplicate variation barcode in this product: ${dupes[0]}`,
+      400,
+    );
+  }
+
+  const [productClash, variationClash] = await Promise.all([
+    prisma.product.findFirst({
+      where: {
+        barcode: { in: barcodes },
+        ...(excludeProductId ? { NOT: { id: excludeProductId } } : {}),
+      },
+      select: { barcode: true },
+    }),
+    prisma.productVariation.findFirst({
+      where: {
+        barcode: { in: barcodes },
+        ...(excludeProductId ? { NOT: { productId: excludeProductId } } : {}),
+      },
+      select: { barcode: true },
+    }),
+  ]);
+
+  const clash = productClash?.barcode || variationClash?.barcode;
+  if (clash) {
+    throw new AppError(
+      `Barcode "${clash}" is already in use by another product/variation`,
+      409,
+    );
+  }
+}
+
 // GET /api/v1/products/shippable
 // Returns only products that have: at least 1 image, weight set, and price > 0
 // Useful for shipping calculators, catalogue exports, and featured displays
@@ -142,6 +242,9 @@ export const getProduct = async (
           orderBy: { createdAt: "desc" },
           take: 10,
         },
+        variations: {
+          orderBy: [{ sortOrder: "asc" }, { quantity: "asc" }],
+        },
         _count: { select: { reviews: true } },
       },
     });
@@ -238,6 +341,7 @@ export const createProduct = async (
       maxOrderQty,
       scaleStep,
       scalePresets,
+      variations,
     } = req.body;
 
     // Validate unique slug
@@ -257,6 +361,14 @@ export const createProduct = async (
       });
       if (!category) throw new NotFoundError("Category not found");
     }
+
+    // Validate variation barcodes are unique (against other products' own
+    // barcode, other products' variation barcodes, and duplicates within
+    // this payload) — a barcode must resolve to exactly one scannable thing.
+    const incomingVariations: any[] = Array.isArray(variations)
+      ? variations
+      : [];
+    await assertVariationBarcodesAvailable(incomingVariations);
 
     // Create product with all fields including SEO
     const product = await prisma.product.create({
@@ -322,8 +434,12 @@ export const createProduct = async (
         maxOrderQty: maxOrderQty ?? null,
         scaleStep: scaleStep ?? null,
         scalePresets: scalePresets ?? [],
+        // Structured variations (dynamic per-preset pricing + stock)
+        variations: incomingVariations.length
+          ? { create: incomingVariations.map(toVariationCreateInput) }
+          : undefined,
       },
-      include: { category: true, brand: true },
+      include: { category: true, brand: true, variations: true },
     });
 
     // Log inventory if initial stock provided
@@ -380,7 +496,7 @@ export const updateProduct = async (
     const product = await prisma.product.findUnique({ where: { id } });
     if (!product) throw new NotFoundError("Product not found");
 
-    const { slug, sku, categoryId, ...rest } = req.body;
+    const { slug, sku, categoryId, variations, ...rest } = req.body;
 
     // Security: only admins can directly set stockQuantity via this endpoint.
     // Staff and Sales must go through the stock-approval workflow.
@@ -415,6 +531,54 @@ export const updateProduct = async (
       if (existing) throw new AppError("SKU already in use", 409);
     }
 
+    // ── Variations (structured presets) ─────────────────────────────────────
+    // `variations` never gets spread into the Prisma `update` call directly —
+    // a raw array isn't valid nested-write syntax. Instead, when the field is
+    // present we diff it against what's currently stored: rows missing from
+    // the payload are deleted, rows with a known id are updated in place, and
+    // rows without an id are newly created. Sent as `undefined` (field simply
+    // absent from the body), variations are left untouched entirely.
+    if (variations !== undefined) {
+      const incoming: VariationInput[] = Array.isArray(variations)
+        ? variations
+        : [];
+      await assertVariationBarcodesAvailable(incoming, id);
+
+      const existingVariations = await prisma.productVariation.findMany({
+        where: { productId: id },
+        select: { id: true },
+      });
+      const existingIds = new Set(existingVariations.map((v) => v.id));
+      const incomingIds = new Set(
+        incoming.filter((v) => v.id).map((v) => v.id as string),
+      );
+      const idsToDelete = [...existingIds].filter(
+        (eid) => !incomingIds.has(eid),
+      );
+
+      await prisma.$transaction([
+        ...(idsToDelete.length
+          ? [
+              prisma.productVariation.deleteMany({
+                where: { id: { in: idsToDelete } },
+              }),
+            ]
+          : []),
+        ...incoming.map((v) => {
+          const data = toVariationCreateInput(v);
+          if (v.id && existingIds.has(v.id)) {
+            return prisma.productVariation.update({
+              where: { id: v.id },
+              data,
+            });
+          }
+          return prisma.productVariation.create({
+            data: { ...data, productId: id },
+          });
+        }),
+      ]);
+    }
+
     // Update product with all fields
     const updated = await prisma.product.update({
       where: { id },
@@ -424,7 +588,7 @@ export const updateProduct = async (
         ...(sku && { sku }),
         ...(categoryId && { categoryId }),
       },
-      include: { category: true, brand: true },
+      include: { category: true, brand: true, variations: true },
     });
 
     logActivity({
@@ -542,10 +706,74 @@ export const updateInventory = async (
 ) => {
   try {
     const id = req.params.id as string;
-    const { type, quantity, reason } = req.body;
+    const { type, quantity, reason, variationId } = req.body;
 
     const product = await prisma.product.findUnique({ where: { id } });
     if (!product) throw new NotFoundError("Product not found");
+
+    // ── Dedicated variation stock adjustment ─────────────────────────────
+    // If a variationId is supplied AND that variation tracks its own
+    // dedicated stock, adjust the variation's stockQuantity instead of the
+    // shared product pool — keeping the two fully independent, as intended.
+    if (variationId) {
+      const variation = await prisma.productVariation.findFirst({
+        where: { id: variationId, productId: id },
+      });
+      if (!variation)
+        throw new NotFoundError("Product variation not found");
+      if (variation.stockQuantity === null) {
+        throw new AppError(
+          `"${variation.label}" uses shared stock — adjust the base product's stock instead, or switch it to dedicated stock first`,
+          400,
+        );
+      }
+
+      const prevVarQty = variation.stockQuantity;
+      let newVarQty: number;
+      if (type === "PURCHASE" || type === "RETURN") {
+        newVarQty = prevVarQty + quantity;
+      } else if (type === "SALE" || type === "ADJUSTMENT") {
+        newVarQty = prevVarQty - quantity;
+        if (newVarQty < 0) throw new AppError("Insufficient stock", 400);
+      } else {
+        newVarQty = quantity;
+      }
+
+      const actor = req.user?.userId
+        ? await prisma.user.findUnique({
+            where: { id: req.user.userId },
+            select: { name: true },
+          })
+        : null;
+
+      const [updatedVariation] = await prisma.$transaction([
+        prisma.productVariation.update({
+          where: { id: variationId },
+          data: { stockQuantity: newVarQty },
+        }),
+        prisma.inventoryLog.create({
+          data: {
+            productId: id,
+            type,
+            quantity,
+            previousQty: prevVarQty,
+            newQty: newVarQty,
+            reason,
+            variationId,
+            variationLabel: variation.label,
+            stockMode: "DEDICATED",
+            performedBy: req.user?.userId,
+            performedByName: actor?.name,
+          },
+        }),
+      ]);
+
+      return res.status(200).json({
+        success: true,
+        message: "Variation inventory updated",
+        data: { variation: updatedVariation },
+      });
+    }
 
     const previousQty = product.stockQuantity;
     let newQty: number;
@@ -698,7 +926,25 @@ export const getProducts = async (
     if (isFeatured === "true") where.isFeatured = true;
     if (isNewArrival === "true") where.isNewArrival = true;
     if (isOnPromotion === "true") where.isOnPromotion = true;
-    if (barcode) where.barcode = barcode as string;
+    // A barcode scan can match either the product's own barcode OR a
+    // specific variation's dedicated barcode (e.g. scanning a pre-labeled
+    // "500g Pack" sticker) — POS relies on this to add the right preset
+    // directly instead of falling back to the base product.
+    if (barcode) {
+      const barcodeOr = [
+        { barcode: barcode as string },
+        { variations: { some: { barcode: barcode as string } } },
+      ];
+      // If a text `search` OR clause is already set, AND the two together
+      // instead of clobbering it (barcode scans normally arrive alone, but
+      // this keeps combined queries correct too).
+      if (where.OR) {
+        where.AND = [...(where.AND || []), { OR: where.OR }, { OR: barcodeOr }];
+        delete where.OR;
+      } else {
+        where.OR = barcodeOr;
+      }
+    }
     if (tags) where.tags = { hasSome: (tags as string).split(",") };
 
     // ── Sorting ──────────────────────────────────────────────────────────────
@@ -865,6 +1111,10 @@ export const getProducts = async (
           include: {
             category: { select: { id: true, name: true, slug: true } },
             brand: { select: { id: true, name: true, slug: true, logo: true } },
+            variations: {
+              where: { isActive: true },
+              orderBy: [{ sortOrder: "asc" }, { quantity: "asc" }],
+            },
             _count: { select: { reviews: true } },
           },
         }),
