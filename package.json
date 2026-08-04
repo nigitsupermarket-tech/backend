@@ -45,6 +45,7 @@
     "pdfkit": "^0.17.2",
     "react-quill": "^2.0.0",
     "uuid": "^11.0.6",
+    "xlsx": "^0.18.5",
     "zod": "^4.3.6"
   },
   "devDependencies": {

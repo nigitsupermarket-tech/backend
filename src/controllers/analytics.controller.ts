@@ -229,6 +229,8 @@ export const getDashboardStats = async (
       totalProducts,
       lowStockCount,
       outOfStockCount,
+      lowStockVariationCount,
+      outOfStockVariationCount,
       pendingOrders,
       todayPOSOrders,
       todayPOSSales,
@@ -262,6 +264,19 @@ export const getDashboardStats = async (
         where: { stockQuantity: { gt: 0, lte: 10 }, status: "ACTIVE" },
       }),
       prisma.product.count({ where: { stockQuantity: 0, status: "ACTIVE" } }),
+      // Dedicated-stock presets running low/out — counted separately from
+      // the parent product so a preset selling out (e.g. "290 G" packs)
+      // shows up here even while the shared pool and other presets are fine.
+      prisma.productVariation.count({
+        where: {
+          stockQuantity: { gt: 0, lte: 10 },
+          isActive: true,
+          product: { status: "ACTIVE" },
+        },
+      }),
+      prisma.productVariation.count({
+        where: { stockQuantity: 0, isActive: true, product: { status: "ACTIVE" } },
+      }),
       prisma.order.count({ where: { status: "PENDING" } }),
       prisma.pOSOrder.count({
         where: { status: "COMPLETED", createdAt: { gte: startOfToday } },
@@ -386,8 +401,8 @@ export const getDashboardStats = async (
         },
         inventory: {
           total: totalProducts,
-          lowStock: lowStockCount,
-          outOfStock: outOfStockCount,
+          lowStock: lowStockCount + lowStockVariationCount,
+          outOfStock: outOfStockCount + outOfStockVariationCount,
         },
         pos: {
           ordersToday: todayPOSOrders,
@@ -711,7 +726,13 @@ export const getInventoryReport = async (
   next: NextFunction,
 ) => {
   try {
-    const [lowStockData, outOfStockData, totalValue] = await Promise.all([
+    const [
+      lowStockData,
+      outOfStockData,
+      totalValue,
+      lowStockVariations,
+      outOfStockVariations,
+    ] = await Promise.all([
       prisma.product.findMany({
         where: { stockQuantity: { gt: 0, lte: 10 }, status: "ACTIVE" },
         select: {
@@ -740,6 +761,42 @@ export const getInventoryReport = async (
         where: { status: "ACTIVE" },
         _sum: { stockQuantity: true },
       }),
+      // ── Dedicated-stock presets running low ──────────────────────────────
+      // A variation with its own stockQuantity (not null) can sell out
+      // independently of the parent product's shared pool — e.g. "290 G"
+      // packs run out while "240 G" and the loose kg pool are both fine.
+      // Without this, that preset silently goes unavailable with nothing
+      // showing up here or on the dashboard.
+      prisma.productVariation.findMany({
+        where: {
+          stockQuantity: { gt: 0, lte: 10 },
+          isActive: true,
+          product: { status: "ACTIVE" },
+        },
+        select: {
+          id: true,
+          label: true,
+          stockQuantity: true,
+          productId: true,
+          product: { select: { id: true, name: true, sku: true, images: true } },
+        },
+        orderBy: { stockQuantity: "asc" },
+      }),
+      prisma.productVariation.findMany({
+        where: {
+          stockQuantity: 0,
+          isActive: true,
+          product: { status: "ACTIVE" },
+        },
+        select: {
+          id: true,
+          label: true,
+          stockQuantity: true,
+          productId: true,
+          product: { select: { id: true, name: true, sku: true, images: true } },
+        },
+        orderBy: { label: "asc" },
+      }),
     ]);
     const calc = (p: any) =>
       p.stockQuantity === 0
@@ -747,19 +804,36 @@ export const getInventoryReport = async (
         : p.stockQuantity <= p.lowStockThreshold
           ? "LOW_STOCK"
           : "IN_STOCK";
-    res
-      .status(200)
-      .json({
-        success: true,
-        data: {
-          lowStock: lowStockData.map((p) => ({ ...p, stockStatus: calc(p) })),
-          outOfStock: outOfStockData.map((p) => ({
-            ...p,
-            stockStatus: calc(p),
-          })),
-          totalStockUnits: totalValue._sum.stockQuantity || 0,
-        },
-      });
+
+    // Reshape a preset row into the same flat shape the frontend already
+    // renders for products, plus variation-identifying fields so the
+    // Inventory page can route its "Adjust" action to the right target.
+    const mapVariation = (v: any, status: string) => ({
+      id: v.product.id,
+      name: v.product.name,
+      sku: v.product.sku,
+      images: v.product.images,
+      stockQuantity: v.stockQuantity,
+      lowStockThreshold: 10,
+      stockStatus: status,
+      variationId: v.id,
+      variationLabel: v.label,
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        lowStock: [
+          ...lowStockData.map((p) => ({ ...p, stockStatus: calc(p) })),
+          ...lowStockVariations.map((v) => mapVariation(v, "LOW_STOCK")),
+        ],
+        outOfStock: [
+          ...outOfStockData.map((p) => ({ ...p, stockStatus: calc(p) })),
+          ...outOfStockVariations.map((v) => mapVariation(v, "OUT_OF_STOCK")),
+        ],
+        totalStockUnits: totalValue._sum.stockQuantity || 0,
+      },
+    });
   } catch (error) {
     next(error);
   }

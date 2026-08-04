@@ -13,6 +13,9 @@ import {
   updatePrivacy,
   updateTerms,
   updateNotifications,
+  getSmsSettings,
+  updateSmsSettings,
+  sendTestSms,
 } from "../controllers/settings.controller";
 import {
   protect,
@@ -38,5 +41,10 @@ router.put("/contact-page", protect, adminOnly, updateContactPage);
 router.put("/privacy", protect, adminOnly, updatePrivacy);
 router.put("/terms", protect, adminOnly, updateTerms);
 router.put("/notifications", protect, adminOnly, updateNotifications);
+
+// SMS provider settings (Termii, etc.) — feeds the bulk-SMS marketing feature
+router.get("/sms", protect, adminOnly, getSmsSettings);
+router.put("/sms", protect, adminOnly, updateSmsSettings);
+router.post("/sms/test", protect, adminOnly, sendTestSms);
 
 export default router;

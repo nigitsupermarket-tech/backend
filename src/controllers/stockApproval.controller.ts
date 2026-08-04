@@ -16,13 +16,14 @@ export const createStockRequest = async (
   next: NextFunction,
 ) => {
   try {
-    const { productId, requestedQty, reason, source } = req.body;
+    const { productId, requestedQty, reason, source, variationId } = req.body;
 
     if (requestedQty === undefined || requestedQty < 0)
       throw new AppError("requestedQty must be >= 0", 400);
 
     const product = await prisma.product.findUnique({
       where: { id: productId },
+      include: { variations: true },
     });
     if (!product) throw new NotFoundError("Product not found");
 
@@ -31,36 +32,64 @@ export const createStockRequest = async (
     });
     if (!user) throw new NotFoundError("User not found");
 
+    // ── Resolve target: whole product (shared "per unit" pool) or one
+    // specific preset's OWN dedicated stock ─────────────────────────────
+    let variation: { id: string; label: string; stockQuantity: number | null } | null = null;
+    if (variationId) {
+      const match = product.variations.find((v) => v.id === variationId);
+      if (!match) throw new NotFoundError("Variation not found on this product");
+      if (match.stockQuantity === null || match.stockQuantity === undefined) {
+        throw new AppError(
+          `"${match.label}" shares stock with the product's main pool — adjust the product's stock directly instead of this preset.`,
+          400,
+        );
+      }
+      variation = match;
+    }
+
+    const currentQty = variation ? (variation.stockQuantity as number) : product.stockQuantity;
+    const targetLabel = variation ? `${product.name} — ${variation.label}` : product.name;
+
     // Admin requests are auto-approved and applied immediately
     if (req.user!.role === "ADMIN") {
-      await prisma.product.update({
-        where: { id: productId },
-        data: { stockQuantity: requestedQty },
-      });
-      await prisma.inventoryLog.create({
-        data: {
-          productId,
-          type: "ADJUSTMENT",
-          quantity: Math.abs(requestedQty - product.stockQuantity),
-          previousQty: product.stockQuantity,
-          newQty: requestedQty,
-          reason: reason || "Admin stock adjustment",
-          reference: `admin:${req.user!.userId}`,
-          performedBy: req.user!.userId,
-          performedByName: user.name,
-        },
-      });
+      await prisma.$transaction([
+        variation
+          ? prisma.productVariation.update({
+              where: { id: variation.id },
+              data: { stockQuantity: requestedQty },
+            })
+          : prisma.product.update({
+              where: { id: productId },
+              data: { stockQuantity: requestedQty },
+            }),
+        prisma.inventoryLog.create({
+          data: {
+            productId,
+            type: "ADJUSTMENT",
+            quantity: Math.abs(requestedQty - currentQty),
+            previousQty: currentQty,
+            newQty: requestedQty,
+            reason: reason || "Admin stock adjustment",
+            reference: `admin:${req.user!.userId}`,
+            variationId: variation?.id,
+            variationLabel: variation?.label,
+            stockMode: variation ? "DEDICATED" : undefined,
+            performedBy: req.user!.userId,
+            performedByName: user.name,
+          },
+        }),
+      ]);
 
       // Notify admin notification emails (fire-and-forget)
       prisma.siteSetting.findFirst().then((cfg) => {
         const adminEmails: string[] = (cfg as any)?.adminNotificationEmails ?? [];
         if (adminEmails.length === 0) return;
         sendAdminStockNotificationEmail(adminEmails, {
-          productName: product.name,
+          productName: targetLabel,
           productSku: product.sku,
           requestedBy: user.name,
           requestedByRole: req.user!.role,
-          currentQty: product.stockQuantity,
+          currentQty,
           requestedQty,
           reason,
           source: source || "INVENTORY",
@@ -81,9 +110,11 @@ export const createStockRequest = async (
         productId,
         productName: product.name,
         productSku: product.sku,
+        variationId: variation?.id,
+        variationLabel: variation?.label,
         requestedBy: req.user!.userId,
         requestedByName: user.name,
-        currentQty: product.stockQuantity,
+        currentQty,
         requestedQty,
         reason,
         source: source || "INVENTORY",
@@ -96,11 +127,11 @@ export const createStockRequest = async (
       const adminEmails: string[] = (cfg as any)?.adminNotificationEmails ?? [];
       if (adminEmails.length === 0) return;
       sendAdminStockNotificationEmail(adminEmails, {
-        productName: product.name,
+        productName: targetLabel,
         productSku: product.sku,
         requestedBy: user.name,
         requestedByRole: req.user!.role,
-        currentQty: product.stockQuantity,
+        currentQty,
         requestedQty,
         reason,
         source: source || "INVENTORY",
@@ -113,7 +144,7 @@ export const createStockRequest = async (
       action: "request stock change",
       entity: "product",
       entityId: productId,
-      metadata: { productName: product.name, productSku: product.sku, currentQty: product.stockQuantity, requestedQty, reason, source },
+      metadata: { productName: targetLabel, productSku: product.sku, currentQty, requestedQty, reason, source, variationId: variation?.id },
       req,
     });
 
@@ -175,6 +206,8 @@ export const getStockRequests = async (
               sku: true,
               images: true,
               stockQuantity: true,
+              isScalable: true,
+              scaleUnit: true,
             },
           },
         },
@@ -223,12 +256,19 @@ export const approveStockRequest = async (
       where: { id: req.user!.userId },
     });
 
-    // Apply the stock change + mark approved atomically
+    // Apply the stock change + mark approved atomically — to the specific
+    // variation's dedicated stock if this request targeted one, otherwise
+    // to the product's shared "per unit" pool.
     await prisma.$transaction([
-      prisma.product.update({
-        where: { id: request.productId },
-        data: { stockQuantity: request.requestedQty },
-      }),
+      request.variationId
+        ? prisma.productVariation.update({
+            where: { id: request.variationId },
+            data: { stockQuantity: request.requestedQty },
+          })
+        : prisma.product.update({
+            where: { id: request.productId },
+            data: { stockQuantity: request.requestedQty },
+          }),
       prisma.inventoryLog.create({
         data: {
           productId: request.productId,
@@ -238,6 +278,9 @@ export const approveStockRequest = async (
           newQty: request.requestedQty,
           reason: `Approved by ${admin?.name || "admin"} — ${request.reason || "stock adjustment"}`,
           reference: `approval:${id}`,
+          variationId: request.variationId ?? undefined,
+          variationLabel: request.variationLabel ?? undefined,
+          stockMode: request.variationId ? "DEDICATED" : undefined,
           performedBy: req.user!.userId,
           performedByName: admin?.name || "Admin",
         },
@@ -349,10 +392,15 @@ export const bulkApproveStockRequests = async (
     for (const request of requests) {
       try {
         await prisma.$transaction([
-          prisma.product.update({
-            where: { id: request.productId },
-            data: { stockQuantity: request.requestedQty },
-          }),
+          request.variationId
+            ? prisma.productVariation.update({
+                where: { id: request.variationId },
+                data: { stockQuantity: request.requestedQty },
+              })
+            : prisma.product.update({
+                where: { id: request.productId },
+                data: { stockQuantity: request.requestedQty },
+              }),
           prisma.inventoryLog.create({
             data: {
               productId: request.productId,
@@ -362,6 +410,9 @@ export const bulkApproveStockRequests = async (
               newQty: request.requestedQty,
               reason: `Bulk approved by ${admin?.name || "admin"}`,
               reference: `approval:${request.id}`,
+              variationId: request.variationId ?? undefined,
+              variationLabel: request.variationLabel ?? undefined,
+              stockMode: request.variationId ? "DEDICATED" : undefined,
               performedBy: req.user!.userId,
               performedByName: admin?.name || "Admin",
             },

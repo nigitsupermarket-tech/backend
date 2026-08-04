@@ -705,6 +705,18 @@ export const updateInventory = async (
   next: NextFunction,
 ) => {
   try {
+    // This endpoint writes stock immediately with no approval step — unlike
+    // the product-form and Inventory page, which route staff/sales changes
+    // through /stock-approvals. Restricting it to admins keeps that the
+    // ONLY path for anyone else to change stock, whether product-level or
+    // a specific preset's dedicated stock.
+    if (req.user?.role !== "ADMIN") {
+      throw new AppError(
+        "Only admins can adjust inventory directly. Submit a stock change request instead.",
+        403,
+      );
+    }
+
     const id = req.params.id as string;
     const { type, quantity, reason, variationId } = req.body;
 

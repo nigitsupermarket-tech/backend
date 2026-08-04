@@ -1,8 +1,10 @@
 import { Request, Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import { AppError } from "../utils/appError";
 import { deleteCloudinaryImage } from "../lib/cloudinary";
 import { log as logActivity } from "../utils/activityLogger";
+import { sendSms, assertSmsConfigured } from "../services/sms.service";
 
 // ── In-memory settings cache ──────────────────────────────────────────────────
 // /api/v1/settings was being called 4-6 times per page load and took 2500ms
@@ -686,6 +688,97 @@ export const updateNotifications = async (
       message: "Notification settings updated",
       data: { settings: updated },
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/v1/settings/sms  (admin only — wired up to support the bulk-SMS feature)
+export const getSmsSettings = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const settings = await getOrFetchSettings();
+    res.status(200).json({
+      success: true,
+      data: {
+        settings: {
+          smsProvider: (settings as any).smsProvider,
+          smsApiKey: (settings as any).smsApiKey,
+          smsSenderId: (settings as any).smsSenderId,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// PUT /api/v1/settings/sms  (admin only)
+export const updateSmsSettings = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { smsProvider, smsApiKey, smsSenderId } = req.body as {
+      smsProvider?: string;
+      smsApiKey?: string;
+      smsSenderId?: string;
+    };
+
+    let settings = await prisma.siteSetting.findFirst();
+    if (!settings) settings = await prisma.siteSetting.create({ data: {} });
+
+    const data: any = {};
+    if (smsProvider !== undefined) data.smsProvider = smsProvider;
+    if (smsApiKey !== undefined) data.smsApiKey = smsApiKey;
+    if (smsSenderId !== undefined) data.smsSenderId = smsSenderId;
+
+    const updated = await prisma.siteSetting.update({
+      where: { id: settings.id },
+      data,
+    });
+
+    invalidateSettingsCache();
+    res.status(200).json({
+      success: true,
+      message: "SMS settings saved",
+      data: {
+        settings: {
+          smsProvider: (updated as any).smsProvider,
+          smsApiKey: (updated as any).smsApiKey,
+          smsSenderId: (updated as any).smsSenderId,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/v1/settings/sms/test  (admin only)
+// Sends a real test SMS via whichever provider is configured — surfaces the
+// same "not configured" error the bulk-send flow uses, so a failed test here
+// tells the admin exactly what's missing.
+export const sendTestSms = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { phone } = req.body as { phone?: string };
+    if (!phone) throw new AppError("Phone number is required", 400);
+
+    await assertSmsConfigured();
+    await sendSms({
+      to: phone,
+      message: "This is a test SMS from your admin panel. SMS sending is working correctly.",
+    });
+
+    res.status(200).json({ success: true, message: "Test SMS sent" });
   } catch (error) {
     next(error);
   }
