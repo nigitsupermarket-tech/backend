@@ -123,7 +123,9 @@ export function parseRecipientsFromSpreadsheet(
   dataRows.forEach((row, i) => {
     const rowNumber = i + 2; // +1 for header, +1 for 1-indexing
     const rawEmail = row[emailColIdx];
-    const email = String(rawEmail ?? "").trim().toLowerCase();
+    const email = String(rawEmail ?? "")
+      .trim()
+      .toLowerCase();
     const rawName = nameColIdx !== -1 ? row[nameColIdx] : "";
     const name = String(rawName ?? "").trim();
 
@@ -132,12 +134,18 @@ export function parseRecipientsFromSpreadsheet(
       return;
     }
     if (!EMAIL_REGEX.test(email)) {
-      skipped.push({ row: rowNumber, reason: `Invalid email format: "${email}"` });
+      skipped.push({
+        row: rowNumber,
+        reason: `Invalid email format: "${email}"`,
+      });
       return;
     }
     if (seenEmails.has(email)) {
       duplicateCount++;
-      skipped.push({ row: rowNumber, reason: `Duplicate of an earlier row: ${email}` });
+      skipped.push({
+        row: rowNumber,
+        reason: `Duplicate of an earlier row: ${email}`,
+      });
       return;
     }
 
@@ -224,7 +232,13 @@ function isPlausiblePhone(digits: string): boolean {
 export function parsePhoneRecipientsFromSpreadsheet(
   buffer: Buffer,
   originalFilename?: string,
-): { recipients: ParsedPhoneRecipient[]; totalRows: number; validCount: number; duplicateCount: number; skipped: SkippedRow[] } {
+): {
+  recipients: ParsedPhoneRecipient[];
+  totalRows: number;
+  validCount: number;
+  duplicateCount: number;
+  skipped: SkippedRow[];
+} {
   let workbook: XLSX.WorkBook;
   try {
     workbook = XLSX.read(buffer, { type: "buffer" });
@@ -236,7 +250,8 @@ export function parsePhoneRecipientsFromSpreadsheet(
   }
 
   const sheetName = workbook.SheetNames[0];
-  if (!sheetName) throw new AppError("The uploaded spreadsheet has no sheets.", 400);
+  if (!sheetName)
+    throw new AppError("The uploaded spreadsheet has no sheets.", 400);
   const sheet = workbook.Sheets[sheetName];
 
   const rows: unknown[][] = XLSX.utils.sheet_to_json(sheet, {
@@ -245,7 +260,8 @@ export function parsePhoneRecipientsFromSpreadsheet(
     blankrows: false,
   });
 
-  if (rows.length === 0) throw new AppError("The uploaded spreadsheet is empty.", 400);
+  if (rows.length === 0)
+    throw new AppError("The uploaded spreadsheet is empty.", 400);
 
   const headerRow = (rows[0] || []).map((h) => String(h ?? ""));
   const phoneColIdx = findColumnIndex(headerRow, PHONE_HEADER_ALIASES);
@@ -278,12 +294,18 @@ export function parsePhoneRecipientsFromSpreadsheet(
 
     const normalized = normalizePhone(originalEntry);
     if (!isPlausiblePhone(normalized)) {
-      skipped.push({ row: rowNumber, reason: `Invalid phone number: "${originalEntry}"` });
+      skipped.push({
+        row: rowNumber,
+        reason: `Invalid phone number: "${originalEntry}"`,
+      });
       return;
     }
     if (seenPhones.has(normalized)) {
       duplicateCount++;
-      skipped.push({ row: rowNumber, reason: `Duplicate of an earlier row: ${normalized}` });
+      skipped.push({
+        row: rowNumber,
+        reason: `Duplicate of an earlier row: ${normalized}`,
+      });
       return;
     }
 
