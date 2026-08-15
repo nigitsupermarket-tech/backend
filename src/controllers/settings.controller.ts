@@ -123,6 +123,7 @@ export const updateSettings = async (
       "maintenanceMessage",
       "allowGuestCheckout",
       "hidePricing",
+      "hidePricesUntilLogin",
       "adminNotificationEmails", // JSON array of emails that receive admin alerts
     ];
 
@@ -146,6 +147,9 @@ export const updateSettings = async (
     }
     if (req.body.hidePricing !== undefined) {
       data.hidePricing = Boolean(req.body.hidePricing);
+    }
+    if (req.body.hidePricesUntilLogin !== undefined) {
+      data.hidePricesUntilLogin = Boolean(req.body.hidePricesUntilLogin);
     }
 
     const updated = await prisma.siteSetting.update({

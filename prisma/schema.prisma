@@ -194,6 +194,11 @@ model SiteSetting {
   // Pricing Visibility (always show for grocery)
   hidePricing       Boolean  @default(false)
 
+  // Hide prices site-wide (product cards, single product page, cart, etc.)
+  // from anyone who isn't signed in yet. Once a customer logs in or
+  // registers, prices display normally everywhere. Defaults to ON.
+  hidePricesUntilLogin Boolean @default(true)
+
   // Store Info (for POS & Pickup)
   storeAddress      String?  @default("Port Harcourt, Rivers State")
   storeCity         String?  @default("Port Harcourt")
@@ -772,6 +777,7 @@ model POSOrder {
   sessionId       String?          @db.ObjectId // FK to the POSSession this order was made under (null = made outside any session)
 
   processedBy     User             @relation(fields: [processedById], references: [id])
+  voidRequests    VoidApprovalRequest[]
 
   @@map("pos_orders")
 }
@@ -1192,4 +1198,33 @@ model StockApprovalRequest {
   product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
 
   @@map("stock_approval_requests")
+}
+
+// ============================================
+// POS VOID-ORDER APPROVAL REQUESTS
+// ============================================
+// Only ADMIN can void a POS order directly. Every other role (STAFF,
+// SALES, MANAGER) must submit a request here for an admin to approve —
+// mirrors StockApprovalRequest above.
+
+model VoidApprovalRequest {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  posOrderId      String    @db.ObjectId
+  posOrderNumber  String
+  orderTotal      Float
+  requestedBy     String    @db.ObjectId
+  requestedByName String
+  requestedByRole String
+  reason          String
+  status          String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  reviewedBy      String?   @db.ObjectId
+  reviewedByName  String?
+  reviewedAt      DateTime?
+  reviewNote      String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  posOrder        POSOrder  @relation(fields: [posOrderId], references: [id], onDelete: Cascade)
+
+  @@map("void_approval_requests")
 }

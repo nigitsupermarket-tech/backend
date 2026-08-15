@@ -4,6 +4,12 @@ import {
   getPOSOrders,
   getPOSOrder,
   voidPOSOrder,
+  requestVoidOrder,
+  getOrderVoidRequestStatus,
+  getVoidRequests,
+  getVoidRequestsPendingCount,
+  approveVoidRequest,
+  rejectVoidRequest,
   getPOSStats,
   openPOSSession,
   closePOSSession,
@@ -13,7 +19,7 @@ import {
   resumePOSOrder,
   holdNewPOSOrder,
 } from "../controllers/pos.controller";
-import { protect, staffOrAdmin } from "../middlewares/auth.middleware";
+import { protect, staffOrAdmin, adminOnly } from "../middlewares/auth.middleware";
 
 const router = Router();
 
@@ -27,9 +33,18 @@ router.get("/orders/suspended", getSuspendedOrders); // list held orders for thi
 router.post("/orders", createPOSOrder); // normal completed order
 router.get("/orders", getPOSOrders);
 router.get("/orders/:id", getPOSOrder);
-router.put("/orders/:id/void", voidPOSOrder);
+// Voiding — ADMIN-only. Every other role must request approval instead.
+router.put("/orders/:id/void", adminOnly, voidPOSOrder);
+router.post("/orders/:id/void-request", requestVoidOrder); // non-admin requests approval
+router.get("/orders/:id/void-request", getOrderVoidRequestStatus); // check pending/approved/rejected status
 router.put("/orders/:id/suspend", suspendPOSOrder); // suspend an already-OPEN order
 router.put("/orders/:id/resume", resumePOSOrder); // resume a SUSPENDED order
+
+// Void approval queue — ADMIN-only
+router.get("/void-requests", adminOnly, getVoidRequests);
+router.get("/void-requests/pending-count", adminOnly, getVoidRequestsPendingCount);
+router.put("/void-requests/:id/approve", adminOnly, approveVoidRequest);
+router.put("/void-requests/:id/reject", adminOnly, rejectVoidRequest);
 
 // Stats
 router.get("/stats", getPOSStats);

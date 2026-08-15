@@ -601,3 +601,57 @@ export async function sendAdminStockNotificationEmail(
     ),
   );
 }
+
+// ── POS void-order approval request ─────────────────────────────────────────
+export async function sendAdminVoidRequestEmail(
+  adminEmails: string[],
+  params: {
+    posOrderNumber: string;
+    orderTotal: number;
+    requestedBy: string;
+    requestedByRole: string;
+    reason: string;
+  },
+): Promise<void> {
+  if (!adminEmails || adminEmails.length === 0) return;
+
+  const adminVoidUrl = `${process.env.ADMIN_URL || process.env.CLIENT_URL}/admin/pos/void-requests`;
+
+  const html = `
+    <!DOCTYPE html><html><head><meta charset="utf-8"><style>${baseStyles}
+      .void-box { background:#fef2f2; border:1px solid #fecaca; border-radius:8px; padding:20px; margin:20px 0; }
+      .badge { display:inline-block; font-weight:700; font-size:13px; padding:3px 10px; border-radius:99px; color:#d97706; }
+    </style></head>
+    <body><div class="wrapper"><div class="container">
+      <div class="header"><h1>⚠️ Void Order Approval Needed</h1></div>
+      <div class="content">
+        <p>A staff member has requested to void a completed POS order. This requires an admin's approval before it takes effect.</p>
+        <div class="void-box">
+          <p style="margin:0 0 8px;"><strong>Order:</strong> ${params.posOrderNumber}</p>
+          <p style="margin:0 0 8px;"><strong>Order total:</strong> ₦${params.orderTotal.toLocaleString()}</p>
+          <p style="margin:0 0 8px;"><strong>Requested by:</strong> ${params.requestedBy} <span style="color:#6b7280;font-size:12px;">(${params.requestedByRole})</span></p>
+          <p style="margin:0 0 8px;"><strong>Reason:</strong> ${params.reason}</p>
+          <p style="margin:0;"><strong>Status:</strong> <span class="badge">PENDING APPROVAL</span></p>
+        </div>
+        <p style="text-align:center;margin:28px 0;">
+          <a href="${adminVoidUrl}" class="button">Review Request</a>
+        </p>
+        <p class="note">This is an automated security notification. Do not reply to this email.</p>
+      </div>
+      <div class="footer"><p>© ${new Date().getFullYear()} Nigittriple Industry. All rights reserved.</p></div>
+    </div></div></body></html>
+  `;
+
+  const subject = `Void Request: ${params.posOrderNumber} by ${params.requestedBy} — Awaiting Approval`;
+
+  await Promise.allSettled(
+    adminEmails.map((adminEmail) =>
+      sendEmail({
+        to: adminEmail,
+        subject,
+        html,
+        text: `${params.requestedBy} (${params.requestedByRole}) requested to void order ${params.posOrderNumber} (₦${params.orderTotal.toLocaleString()}). Reason: ${params.reason}. Status: PENDING APPROVAL.`,
+      }),
+    ),
+  );
+}

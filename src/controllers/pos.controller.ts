@@ -4,6 +4,7 @@ import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
 import { log as logActivity } from "../utils/activityLogger";
+import { sendAdminVoidRequestEmail } from "../services/email.service";
 import {
   findActiveVariation,
   resolveVariationLine,
@@ -440,17 +441,17 @@ export const getPOSOrder = async (
   }
 };
 
-// ── PUT /api/v1/pos/orders/:id/void ──────────────────────────────────────────
-
-export const voidPOSOrder = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
+// ── Shared void-execution logic ──────────────────────────────────────────────
+// Used by both the direct admin void (voidPOSOrder) and by an admin
+// approving a pending void request (approveVoidRequest) — the actual
+// stock-restoration + status-flip work is identical either way, only *who*
+// is allowed to trigger it (and whether an approval hop is required first)
+// differs.
+const executeVoidOrder = async (
+  id: string,
+  reason: string | undefined,
+  performedBy: string | undefined,
 ) => {
-  try {
-    const id = req.params.id as string; // ✅ fixes lines 276 & 287
-    const { reason } = req.body;
-
     // Fetch the order (no include needed here — we get items inside tx below)
     const order = await prisma.pOSOrder.findUnique({ where: { id } });
     if (!order) throw new NotFoundError("POS order not found");
@@ -537,7 +538,7 @@ export const voidPOSOrder = async (
                         variationId: item.variationId,
                         variationLabel: label,
                         stockMode: "DEDICATED",
-                        performedBy: req.user?.userId,
+                        performedBy: performedBy,
                       },
                     }),
                   ]);
@@ -568,7 +569,7 @@ export const voidPOSOrder = async (
                       variationId: item.variationId,
                       variationLabel: label,
                       stockMode: "SHARED",
-                      performedBy: req.user?.userId,
+                      performedBy: performedBy,
                     },
                   }),
                 ]);
@@ -592,7 +593,7 @@ export const voidPOSOrder = async (
                     newQty: product.stockQuantity + item.quantity,
                     reason: `POS void: ${reason || "no reason"}`,
                     reference: order.posOrderNumber,
-                    performedBy: req.user?.userId,
+                    performedBy: performedBy,
                   },
                 }),
               ]);
@@ -606,9 +607,336 @@ export const voidPOSOrder = async (
       },
     );
 
+    return order;
+};
+
+// ── PUT /api/v1/pos/orders/:id/void ──────────────────────────────────────────
+// ADMIN-ONLY (also enforced by the `adminOnly` route middleware — the check
+// here is defense-in-depth in case this handler is ever wired up elsewhere).
+// Every other role must go through requestVoidOrder() below instead.
+
+export const voidPOSOrder = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (req.user?.role !== "ADMIN") {
+      throw new AppError(
+        "Only an admin can void an order directly. Please request approval from an admin instead.",
+        403,
+      );
+    }
+    const id = req.params.id as string;
+    const { reason } = req.body;
+
+    await executeVoidOrder(id, reason, req.user?.userId);
+
+    logActivity({
+      userId: req.user?.userId,
+      action: "void POS order",
+      entity: "pos_order",
+      entityId: id,
+      metadata: { reason },
+      req,
+    });
+
     res
       .status(200)
       .json({ success: true, message: "Order voided successfully" });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── POST /api/v1/pos/orders/:id/void-request ─────────────────────────────────
+// Non-admin roles (STAFF, SALES, MANAGER) can't void an order directly —
+// they submit a request here that sits PENDING until an admin approves or
+// rejects it. Admins should use the direct voidPOSOrder endpoint instead;
+// hitting this as an admin is rejected to avoid confusing double-flows.
+
+export const requestVoidOrder = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (req.user?.role === "ADMIN") {
+      throw new AppError(
+        "Admins can void this order directly — no approval request needed.",
+        400,
+      );
+    }
+
+    const id = req.params.id as string;
+    const { reason } = req.body;
+    if (!reason || !String(reason).trim()) {
+      throw new AppError("A reason is required to request a void", 400);
+    }
+
+    const order = await prisma.pOSOrder.findUnique({ where: { id } });
+    if (!order) throw new NotFoundError("POS order not found");
+    if (order.status === "VOIDED") {
+      throw new AppError("Order is already voided", 400);
+    }
+    if (order.status === "REFUNDED") {
+      throw new AppError("Cannot void a refunded order", 400);
+    }
+
+    const existingPending = await prisma.voidApprovalRequest.findFirst({
+      where: { posOrderId: id, status: "PENDING" },
+    });
+    if (existingPending) {
+      throw new AppError(
+        "A void request for this order is already pending admin approval",
+        400,
+      );
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+    });
+    if (!user) throw new NotFoundError("User not found");
+
+    const request = await prisma.voidApprovalRequest.create({
+      data: {
+        posOrderId: id,
+        posOrderNumber: order.posOrderNumber,
+        orderTotal: order.total,
+        requestedBy: req.user!.userId,
+        requestedByName: user.name,
+        requestedByRole: req.user!.role,
+        reason: String(reason).trim(),
+        status: "PENDING",
+      },
+    });
+
+    // Notify admin notification emails (fire-and-forget)
+    prisma.siteSetting
+      .findFirst()
+      .then((cfg) => {
+        const adminEmails: string[] = (cfg as any)?.adminNotificationEmails ?? [];
+        if (adminEmails.length === 0) return;
+        sendAdminVoidRequestEmail(adminEmails, {
+          posOrderNumber: order.posOrderNumber,
+          orderTotal: order.total,
+          requestedBy: user.name,
+          requestedByRole: req.user!.role,
+          reason: String(reason).trim(),
+        }).catch((err) =>
+          console.error("[email] Void request notification failed:", err),
+        );
+      })
+      .catch(() => {});
+
+    logActivity({
+      userId: req.user!.userId,
+      action: "request order void",
+      entity: "pos_order",
+      entityId: id,
+      metadata: { posOrderNumber: order.posOrderNumber, reason },
+      req,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Void request submitted — awaiting admin approval",
+      data: { request },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── GET /api/v1/pos/orders/:id/void-request ───────────────────────────────────
+// Returns the most recent void request for this order (or null) so the
+// order-detail UI can show a pending/approved/rejected banner instead of
+// the void/request form.
+
+export const getOrderVoidRequestStatus = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const request = await prisma.voidApprovalRequest.findFirst({
+      where: { posOrderId: id },
+      orderBy: { createdAt: "desc" },
+    });
+    res.status(200).json({ success: true, data: { request: request || null } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── GET /api/v1/pos/void-requests ─────────────────────────────────────────────
+// Admin-only — the approval queue, mirrors getStockRequests.
+
+export const getVoidRequests = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { status, search, page = "1", limit = "20" } = req.query;
+
+    const where: any = {};
+    if (status) where.status = status;
+    if (search) {
+      where.OR = [
+        { posOrderNumber: { contains: search as string, mode: "insensitive" } },
+        { requestedByName: { contains: search as string, mode: "insensitive" } },
+      ];
+    }
+
+    const skip = (Number(page) - 1) * Number(limit);
+    const [requests, total] = await Promise.all([
+      prisma.voidApprovalRequest.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip,
+        take: Number(limit),
+      }),
+      prisma.voidApprovalRequest.count({ where }),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        requests,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          totalPages: Math.ceil(total / Number(limit)),
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── GET /api/v1/pos/void-requests/pending-count ───────────────────────────────
+export const getVoidRequestsPendingCount = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const count = await prisma.voidApprovalRequest.count({
+      where: { status: "PENDING" },
+    });
+    res.status(200).json({ success: true, data: { count } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── PUT /api/v1/pos/void-requests/:id/approve ─────────────────────────────────
+// Admin-only — approves the request AND performs the actual void + stock
+// restoration in one step.
+
+export const approveVoidRequest = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const { reviewNote } = req.body;
+
+    const request = await prisma.voidApprovalRequest.findUnique({ where: { id } });
+    if (!request) throw new NotFoundError("Void request not found");
+    if (request.status !== "PENDING") {
+      throw new AppError("Request is no longer pending", 400);
+    }
+
+    const admin = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+    });
+
+    // Perform the actual void — will throw (and leave the request PENDING)
+    // if the order was already voided/refunded by some other path since
+    // the request was made.
+    await executeVoidOrder(request.posOrderId, request.reason, req.user!.userId);
+
+    const updated = await prisma.voidApprovalRequest.update({
+      where: { id },
+      data: {
+        status: "APPROVED",
+        reviewedBy: req.user!.userId,
+        reviewedByName: admin?.name,
+        reviewedAt: new Date(),
+        reviewNote,
+      },
+    });
+
+    logActivity({
+      userId: req.user!.userId,
+      action: "approve void request",
+      entity: "pos_order",
+      entityId: request.posOrderId,
+      metadata: { posOrderNumber: request.posOrderNumber, reviewNote },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Void request approved — order voided and stock restored",
+      data: { request: updated },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── PUT /api/v1/pos/void-requests/:id/reject ──────────────────────────────────
+export const rejectVoidRequest = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const { reviewNote } = req.body;
+
+    const request = await prisma.voidApprovalRequest.findUnique({ where: { id } });
+    if (!request) throw new NotFoundError("Void request not found");
+    if (request.status !== "PENDING") {
+      throw new AppError("Request is no longer pending", 400);
+    }
+
+    const admin = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+    });
+
+    const updated = await prisma.voidApprovalRequest.update({
+      where: { id },
+      data: {
+        status: "REJECTED",
+        reviewedBy: req.user!.userId,
+        reviewedByName: admin?.name,
+        reviewedAt: new Date(),
+        reviewNote,
+      },
+    });
+
+    logActivity({
+      userId: req.user!.userId,
+      action: "reject void request",
+      entity: "pos_order",
+      entityId: request.posOrderId,
+      metadata: { posOrderNumber: request.posOrderNumber, reviewNote },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Void request rejected",
+      data: { request: updated },
+    });
   } catch (error) {
     next(error);
   }
