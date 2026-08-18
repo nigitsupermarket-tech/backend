@@ -10,6 +10,7 @@ import { stringify } from "csv-stringify/sync";
 import https from "https";
 import http from "http";
 import { log as logActivity } from "../utils/activityLogger";
+import { type VariationInput, applyProductVariations } from "./product.controller";
 
 // ── helper: collect PDFDocument into Buffer ───────────────────────────────────
 function pdfToBuffer(doc: InstanceType<typeof PDFDocument>): Promise<Buffer> {
@@ -94,6 +95,28 @@ const PRODUCT_CSV_COLUMNS = [
   "storageInstructions",
   "ingredients",
   "allergens",
+  // ── Scalable / weighted product ──
+  // Kept as a separate trailing block rather than interleaved above, so a
+  // spreadsheet that predates these columns still has every existing
+  // column in the same position — only new columns get appended at the end.
+  "isScalable",
+  "scaleUnit",
+  "pricePerUnit",
+  "minOrderQty",
+  "maxOrderQty",
+  "scaleStep",
+  "scalePresets",
+  "scaleWareCode",
+  // Structured presets (see ProductVariation in schema.prisma) — one JSON
+  // array per row, e.g. [{"label":"500g Pack","quantity":0.5,"price":9000,...}].
+  // This is the only field in this list that isn't a flat scalar; CSV has
+  // no native way to represent a one-to-many relation, and a JSON blob in
+  // a single cell is the only lossless round-trip that doesn't require
+  // inventing a second file/sheet. Importing this column back in re-creates
+  // the exact same variations (matched by "id" when present, so editing a
+  // variation's price in the CSV and re-importing updates it in place
+  // rather than creating a duplicate).
+  "variations",
 ] as const;
 
 // ── EXPORT PRODUCTS CSV ───────────────────────────────────────────────────────
@@ -104,7 +127,7 @@ export const exportProductsCSV = async (
 ) => {
   try {
     const products = await prisma.product.findMany({
-      include: { category: true, brand: true },
+      include: { category: true, brand: true, variations: true },
       orderBy: { createdAt: "desc" },
     });
 
@@ -141,6 +164,30 @@ export const exportProductsCSV = async (
       storageInstructions: p.storageInstructions || "",
       ingredients: p.ingredients || "",
       allergens: (p.allergens || []).join("|"),
+      // ── Scalable / weighted product ──
+      isScalable: p.isScalable,
+      scaleUnit: p.scaleUnit || "",
+      pricePerUnit: p.pricePerUnit ?? "",
+      minOrderQty: p.minOrderQty ?? "",
+      maxOrderQty: p.maxOrderQty ?? "",
+      scaleStep: p.scaleStep ?? "",
+      scalePresets: (p.scalePresets || []).join("|"),
+      scaleWareCode: p.scaleWareCode || "",
+      variations: JSON.stringify(
+        (p.variations || []).map((v) => ({
+          id: v.id,
+          label: v.label,
+          quantity: v.quantity,
+          price: v.price,
+          compareAtPrice: v.compareAtPrice,
+          barcode: v.barcode,
+          sku: v.sku,
+          stockQuantity: v.stockQuantity,
+          isDefault: v.isDefault,
+          isActive: v.isActive,
+          sortOrder: v.sortOrder,
+        })),
+      ),
     }));
 
     const csv = stringify(csvData, {
@@ -324,7 +371,40 @@ export const importProductsCSV = async (
       storageInstructions: row.storageInstructions || null,
       ingredients: row.ingredients || null,
       allergens: row.allergens ? row.allergens.split("|").filter(Boolean) : [],
+      // ── Scalable / weighted product ──
+      isScalable: row.isScalable === "true",
+      scaleUnit: row.scaleUnit || null,
+      pricePerUnit: row.pricePerUnit ? parseFloat(row.pricePerUnit) : null,
+      minOrderQty: row.minOrderQty ? parseFloat(row.minOrderQty) : null,
+      maxOrderQty: row.maxOrderQty ? parseFloat(row.maxOrderQty) : null,
+      scaleStep: row.scaleStep ? parseFloat(row.scaleStep) : null,
+      scalePresets: row.scalePresets
+        ? row.scalePresets
+            .split("|")
+            .map((n: string) => parseFloat(n))
+            .filter((n: number) => !isNaN(n))
+        : [],
+      scaleWareCode: row.scaleWareCode?.trim() || null,
     });
+
+    // Parses the "variations" CSV cell (a JSON array, see PRODUCT_CSV_COLUMNS'
+    // comment) into VariationInput[]. Returns undefined for a blank cell —
+    // meaning "don't touch this product's variations" — and throws a plain
+    // Error (caught per-row, same as every other validation in this import)
+    // for a cell that's present but isn't valid JSON or isn't an array.
+    const parseVariationsCell = (raw: string | undefined): VariationInput[] | undefined => {
+      if (raw === undefined || raw === null || raw.trim() === "") return undefined;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new Error('Invalid "variations" JSON — could not parse');
+      }
+      if (!Array.isArray(parsed)) {
+        throw new Error('"variations" must be a JSON array');
+      }
+      return parsed as VariationInput[];
+    };
 
     // ── One query to fetch all existing products by SKU ────────────────────
     const allSkus = records.map((r: any) => r.sku).filter(Boolean);
@@ -333,6 +413,24 @@ export const importProductsCSV = async (
       select: { id: true, sku: true, stockQuantity: true, name: true },
     });
     const existingMap = new Map(existingProducts.map((p) => [p.sku, p]));
+
+    // ── Batch scale-ware-code uniqueness check ──────────────────────────────
+    // Not enforced at the database level (see the schema comment on
+    // Product.scaleWareCode — Prisma+MongoDB can't create a sparse unique
+    // index). The normal edit flow checks this in createProduct/updateProduct,
+    // but CSV import writes via Prisma directly, so it needs its own check.
+    // wareCodeOwner maps scaleWareCode -> the SKU currently holding it, kept
+    // updated synchronously as rows claim a code, so two rows in the same
+    // CSV can't silently both claim the same code either.
+    const existingWareCodes = await prisma.product.findMany({
+      where: { scaleWareCode: { not: null } },
+      select: { sku: true, scaleWareCode: true },
+    });
+    const wareCodeOwner = new Map<string, string>(
+      existingWareCodes
+        .filter((p) => p.scaleWareCode)
+        .map((p) => [p.scaleWareCode as string, p.sku]),
+    );
 
     // ── Helper: process records in parallel chunks ─────────────────────────
     const CHUNK = 20;
@@ -450,6 +548,47 @@ export const importProductsCSV = async (
               safeData.allergens = row.allergens
                 ? row.allergens.split("|").filter(Boolean)
                 : [];
+            // ── Scalable / weighted product ── (variations deliberately
+            // excluded here — structural/nested changes stay admin-only,
+            // same boundary as new-product creation just above)
+            if (row.isScalable !== undefined)
+              safeData.isScalable = row.isScalable === "true";
+            if (row.scaleUnit !== undefined)
+              safeData.scaleUnit = row.scaleUnit || null;
+            if (row.pricePerUnit !== undefined)
+              safeData.pricePerUnit = row.pricePerUnit
+                ? parseFloat(row.pricePerUnit)
+                : null;
+            if (row.minOrderQty !== undefined)
+              safeData.minOrderQty = row.minOrderQty
+                ? parseFloat(row.minOrderQty)
+                : null;
+            if (row.maxOrderQty !== undefined)
+              safeData.maxOrderQty = row.maxOrderQty
+                ? parseFloat(row.maxOrderQty)
+                : null;
+            if (row.scaleStep !== undefined)
+              safeData.scaleStep = row.scaleStep ? parseFloat(row.scaleStep) : null;
+            if (row.scalePresets !== undefined)
+              safeData.scalePresets = row.scalePresets
+                ? row.scalePresets
+                    .split("|")
+                    .map((n: string) => parseFloat(n))
+                    .filter((n: number) => !isNaN(n))
+                : [];
+            if (row.scaleWareCode !== undefined) {
+              const code = row.scaleWareCode?.trim() || null;
+              if (code) {
+                const owner = wareCodeOwner.get(code);
+                if (owner && owner !== row.sku) {
+                  throw new Error(
+                    `Scale ware code "${code}" is already used by SKU ${owner}`,
+                  );
+                }
+                wareCodeOwner.set(code, row.sku);
+              }
+              safeData.scaleWareCode = code;
+            }
             if (Object.keys(safeData).length > 0) {
               await prisma.product.update({
                 where: { sku: row.sku },
@@ -506,6 +645,25 @@ export const importProductsCSV = async (
       });
     }
 
+    // buildData always fills every field, using a default for anything
+    // absent from the row (needed for CREATE — a new product has to have
+    // *something* in every field). For UPDATE that's dangerous: a CSV
+    // that's missing a column (e.g. an older export, or one intentionally
+    // trimmed to just a few columns for a targeted bulk edit) would silently
+    // reset every field it doesn't mention back to its default — wiping
+    // real data on 1000+ existing products from one re-import. This filters
+    // buildData's output down to only the keys whose column was actually
+    // present in this CSV row (an absent column gives `undefined`; an
+    // empty-but-present cell gives `""`, which still passes through as an
+    // intentional "clear this field").
+    const pickPresentFields = (row: any, data: any): any => {
+      const partial: any = {};
+      for (const key of Object.keys(data)) {
+        if (row[key] !== undefined) partial[key] = data[key];
+      }
+      return partial;
+    };
+
     // ── Admin import: batched parallel upserts ────────────────────────────
     await processChunks(records, async (row: any, rowNum: number) => {
       try {
@@ -515,10 +673,28 @@ export const importProductsCSV = async (
           );
         }
         const existing = existingMap.get(row.sku);
-        const data = buildData(row);
+        const fullData = buildData(row);
+        const data = existing ? pickPresentFields(row, fullData) : fullData;
 
+        // Claim/validate the scale ware code synchronously (before any
+        // `await` below) so two rows in the same parallel chunk can't both
+        // claim the same code — see wareCodeOwner comment above.
+        if (data.scaleWareCode) {
+          const owner = wareCodeOwner.get(data.scaleWareCode);
+          if (owner && owner !== row.sku) {
+            throw new Error(
+              `Scale ware code "${data.scaleWareCode}" is already used by SKU ${owner}`,
+            );
+          }
+          wareCodeOwner.set(data.scaleWareCode, row.sku);
+        }
+
+        const variations = parseVariationsCell(row.variations);
+
+        let productId: string;
         if (existing) {
           await prisma.product.update({ where: { sku: row.sku }, data });
+          productId = existing.id;
         } else {
           data.slug =
             row.slug?.trim() ||
@@ -533,8 +709,14 @@ export const importProductsCSV = async (
           if (slugExists) {
             data.slug = `${data.slug}-${row.sku.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
           }
-          await prisma.product.create({ data });
+          const created = await prisma.product.create({ data });
+          productId = created.id;
         }
+
+        if (variations !== undefined) {
+          await applyProductVariations(productId, variations);
+        }
+
         results.success++;
       } catch (err: any) {
         results.failed++;
@@ -601,6 +783,17 @@ export const downloadCSVTemplate = async (
         storageInstructions: "Store in a cool dry place",
         ingredients: "Ingredient 1, Ingredient 2",
         allergens: "Nuts|Gluten",
+        // ── Scalable / weighted product — leave isScalable "false" and the
+        // rest blank for a normal fixed-price/fixed-quantity product. ──
+        isScalable: "false",
+        scaleUnit: "kg",
+        pricePerUnit: "2000",
+        minOrderQty: "0.1",
+        maxOrderQty: "10",
+        scaleStep: "0.1",
+        scalePresets: "0.5|1|2",
+        scaleWareCode: "",
+        variations: "",
       },
     ];
 

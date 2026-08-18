@@ -13,7 +13,7 @@ import {
 // objects into safe Prisma input, and to make sure a barcode always
 // resolves to exactly one scannable thing (a product OR one variation).
 
-interface VariationInput {
+export interface VariationInput {
   id?: string;
   label: string;
   quantity: number;
@@ -27,7 +27,7 @@ interface VariationInput {
   sortOrder?: number;
 }
 
-function toVariationCreateInput(v: VariationInput) {
+export function toVariationCreateInput(v: VariationInput) {
   if (!v.label || !v.label.trim()) {
     throw new AppError("Every variation needs a label", 400);
   }
@@ -65,7 +65,7 @@ function toVariationCreateInput(v: VariationInput) {
  * `excludeProductId` lets updateProduct ignore the product's own existing
  * records when re-validating on save.
  */
-async function assertVariationBarcodesAvailable(
+export async function assertVariationBarcodesAvailable(
   incoming: VariationInput[],
   excludeProductId?: string,
 ) {
@@ -106,6 +106,42 @@ async function assertVariationBarcodesAvailable(
       409,
     );
   }
+}
+
+// Diffs `incoming` against whatever variations `productId` currently has in
+// the database and writes exactly the difference: rows missing from the
+// payload are deleted, rows carrying a known id are updated in place, rows
+// without an id are newly created. Shared by the normal product-edit save
+// (updateProduct below) and CSV bulk import, so there's exactly one place
+// this logic lives rather than two copies that can quietly drift apart.
+export async function applyProductVariations(
+  productId: string,
+  incoming: VariationInput[],
+) {
+  await assertVariationBarcodesAvailable(incoming, productId);
+
+  const existingVariations = await prisma.productVariation.findMany({
+    where: { productId },
+    select: { id: true },
+  });
+  const existingIds = new Set(existingVariations.map((v) => v.id));
+  const incomingIds = new Set(
+    incoming.filter((v) => v.id).map((v) => v.id as string),
+  );
+  const idsToDelete = [...existingIds].filter((eid) => !incomingIds.has(eid));
+
+  await prisma.$transaction([
+    ...(idsToDelete.length
+      ? [prisma.productVariation.deleteMany({ where: { id: { in: idsToDelete } } })]
+      : []),
+    ...incoming.map((v) => {
+      const data = toVariationCreateInput(v);
+      if (v.id && existingIds.has(v.id)) {
+        return prisma.productVariation.update({ where: { id: v.id }, data });
+      }
+      return prisma.productVariation.create({ data: { ...data, productId } });
+    }),
+  ]);
 }
 
 // GET /api/v1/products/shippable
@@ -570,50 +606,15 @@ export const updateProduct = async (
 
     // ── Variations (structured presets) ─────────────────────────────────────
     // `variations` never gets spread into the Prisma `update` call directly —
-    // a raw array isn't valid nested-write syntax. Instead, when the field is
-    // present we diff it against what's currently stored: rows missing from
-    // the payload are deleted, rows with a known id are updated in place, and
-    // rows without an id are newly created. Sent as `undefined` (field simply
-    // absent from the body), variations are left untouched entirely.
+    // a raw array isn't valid nested-write syntax. applyProductVariations
+    // diffs it against what's currently stored and writes exactly the
+    // difference. Sent as `undefined` (field simply absent from the body),
+    // variations are left untouched entirely.
     if (variations !== undefined) {
       const incoming: VariationInput[] = Array.isArray(variations)
         ? variations
         : [];
-      await assertVariationBarcodesAvailable(incoming, id);
-
-      const existingVariations = await prisma.productVariation.findMany({
-        where: { productId: id },
-        select: { id: true },
-      });
-      const existingIds = new Set(existingVariations.map((v) => v.id));
-      const incomingIds = new Set(
-        incoming.filter((v) => v.id).map((v) => v.id as string),
-      );
-      const idsToDelete = [...existingIds].filter(
-        (eid) => !incomingIds.has(eid),
-      );
-
-      await prisma.$transaction([
-        ...(idsToDelete.length
-          ? [
-              prisma.productVariation.deleteMany({
-                where: { id: { in: idsToDelete } },
-              }),
-            ]
-          : []),
-        ...incoming.map((v) => {
-          const data = toVariationCreateInput(v);
-          if (v.id && existingIds.has(v.id)) {
-            return prisma.productVariation.update({
-              where: { id: v.id },
-              data,
-            });
-          }
-          return prisma.productVariation.create({
-            data: { ...data, productId: id },
-          });
-        }),
-      ]);
+      await applyProductVariations(id, incoming);
     }
 
     // Update product with all fields
