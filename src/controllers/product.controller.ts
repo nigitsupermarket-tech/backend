@@ -192,6 +192,7 @@ export const getShippableProducts = async (
           minOrderQty: true,
           maxOrderQty: true,
           scaleStep: true,
+          scaleWareCode: true,
           scalePresets: true,
           category: { select: { id: true, name: true, slug: true } },
           brand: { select: { id: true, name: true, slug: true, logo: true } },
@@ -341,6 +342,7 @@ export const createProduct = async (
       maxOrderQty,
       scaleStep,
       scalePresets,
+      scaleWareCode,
       variations,
     } = req.body;
 
@@ -433,6 +435,7 @@ export const createProduct = async (
         minOrderQty: minOrderQty ?? null,
         maxOrderQty: maxOrderQty ?? null,
         scaleStep: scaleStep ?? null,
+        scaleWareCode: scaleWareCode?.trim() || null,
         scalePresets: scalePresets ?? [],
         // Structured variations (dynamic per-preset pricing + stock)
         variations: incomingVariations.length

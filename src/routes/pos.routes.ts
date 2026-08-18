@@ -18,6 +18,7 @@ import {
   getSuspendedOrders,
   resumePOSOrder,
   holdNewPOSOrder,
+  resolveScaleBarcode,
 } from "../controllers/pos.controller";
 import { protect, staffOrAdmin, adminOnly } from "../middlewares/auth.middleware";
 
@@ -33,6 +34,10 @@ router.get("/orders/suspended", getSuspendedOrders); // list held orders for thi
 router.post("/orders", createPOSOrder); // normal completed order
 router.get("/orders", getPOSOrders);
 router.get("/orders/:id", getPOSOrder);
+// Scale-printed barcode → product + weight (see resolveScaleBarcode for the
+// field layout). Static path, must stay above nothing here since it's
+// under a distinct prefix already.
+router.get("/scale-barcode/:code", resolveScaleBarcode);
 // Voiding — ADMIN-only. Every other role must request approval instead.
 router.put("/orders/:id/void", adminOnly, voidPOSOrder);
 router.post("/orders/:id/void-request", requestVoidOrder); // non-admin requests approval

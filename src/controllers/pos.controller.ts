@@ -1680,3 +1680,64 @@ export const holdNewPOSOrder = async (
     next(error);
   }
 };
+
+// GET /api/v1/pos/scale-barcode/:code
+//
+// Decodes a barcode printed by the CECON checkout scale itself (not a
+// product's own static barcode — that's handled by the normal
+// GET /products?barcode= lookup). These are 18 numeric digits laid out as:
+//
+//   digits 0-6   (7)  scale "Code" — the scale's own item identifier,
+//                     matched here against Product.scaleWareCode
+//   digits 7-11  (5)  net weight in grams, zero-padded
+//   digits 12-17 (6)  unconfirmed (check digit + likely a per-print
+//                     serial) — deliberately ignored; this app's own
+//                     pricePerUnit is what prices the sale, not anything
+//                     the scale printed on the label
+//
+// Confirmed by cross-referencing two real printed labels against the
+// scale's own Merchandise export (matching Code exactly) and the printed
+// Net Weight (matching the weight field exactly) — see integration notes.
+const SCALE_BARCODE_PATTERN = /^\d{18}$/;
+
+export const resolveScaleBarcode = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const code = req.params.code as string;
+
+    if (!SCALE_BARCODE_PATTERN.test(code)) {
+      throw new AppError("Not a scale-printed barcode (expected 18 digits)", 400);
+    }
+
+    const wareCode = code.slice(0, 7);
+    const weightGrams = parseInt(code.slice(7, 12), 10);
+
+    const product = await prisma.product.findFirst({
+      where: { scaleWareCode: wareCode, isScalable: true, status: "ACTIVE" },
+    });
+
+    if (!product) {
+      throw new NotFoundError(
+        `No product is linked to scale code ${wareCode}. Set its "Scale Ware Code" in the product editor to match what the scale prints.`,
+      );
+    }
+
+    // Always return kg here — the POS's addWeighedToCart already converts
+    // kg → the product's own scaleUnit itself (matching how the live-scale
+    // path feeds it too), so this endpoint shouldn't pre-convert as well.
+    const weightKg = weightGrams / 1000;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        product,
+        weightKg,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};

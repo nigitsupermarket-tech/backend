@@ -332,6 +332,13 @@ pricePerUnit    Float?    // price for 1 unit (used for free-form/custom scale e
 minOrderQty     Float?    // e.g. 0.1
 maxOrderQty     Float?    // e.g. 10n
 scaleStep       Float?    // e.g. 0.1
+  // The CECON scale's own 7-digit item code (its "Code" field, visible on
+  // any label it prints for this product, e.g. mscale's Merchandise table).
+  // Set once per product to link it to the physical scale — NOT kept in
+  // sync with the scale's own PLU database; this app's own price/name
+  // stay authoritative. Used only to recognize which product a printed
+  // scale barcode refers to when it's scanned at checkout.
+  scaleWareCode   String?   @unique
 scalePresets    Float[]   @default([])   // LEGACY: bare quantity presets. Superseded by
                                           // `variations` below, kept for backward compatibility
                                           // with any product that hasn't been migrated yet.
