@@ -350,7 +350,12 @@ export const importProductsCSV = async (
       // categoryId/brandId deliberately NOT included here — see the
       // explicit connect-based handling right before create/update below.
       status: (row.status as any) || "ACTIVE",
-      description: row.description || null,
+      // Product.description is a REQUIRED (non-nullable) field in the
+      // schema — a blank cell must become "" here, not null, or Prisma
+      // rejects the whole row with "Argument description must not be
+      // null." shortDescription right below it IS optional, so that one
+      // correctly stays `|| null`.
+      description: row.description || "",
       shortDescription: row.shortDescription || null,
       isFeatured: row.isFeatured === "true",
       isNewArrival: row.isNewArrival === "true",
@@ -507,7 +512,7 @@ export const importProductsCSV = async (
               safeData.lowStockThreshold = parseInt(row.lowStockThreshold) || 5;
             if (row.status) safeData.status = row.status;
             if (row.description !== undefined)
-              safeData.description = row.description || null;
+              safeData.description = row.description || ""; // required field — see buildData comment
             if (row.shortDescription !== undefined)
               safeData.shortDescription = row.shortDescription || null;
             if (row.isFeatured !== undefined)
