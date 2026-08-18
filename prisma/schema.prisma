@@ -338,7 +338,13 @@ scaleStep       Float?    // e.g. 0.1
   // sync with the scale's own PLU database; this app's own price/name
   // stay authoritative. Used only to recognize which product a printed
   // scale barcode refers to when it's scanned at checkout.
-  scaleWareCode   String?   @unique
+  //
+  // Deliberately NOT @unique here: Prisma's MongoDB connector can only
+  // create a plain (non-sparse) unique index, which rejects more than one
+  // document with a missing/null value — and virtually every product
+  // won't have this set. Uniqueness is enforced in the controller instead
+  // (same pattern already used for slug/sku below).
+  scaleWareCode   String?
 scalePresets    Float[]   @default([])   // LEGACY: bare quantity presets. Superseded by
                                           // `variations` below, kept for backward compatibility
                                           // with any product that hasn't been migrated yet.

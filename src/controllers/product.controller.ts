@@ -372,6 +372,22 @@ export const createProduct = async (
       : [];
     await assertVariationBarcodesAvailable(incomingVariations);
 
+    // Validate scale ware code is available — not database-enforced (see
+    // the schema comment on Product.scaleWareCode), so this is the only
+    // thing standing between two products claiming the same scale code.
+    const normalizedWareCode = scaleWareCode?.trim() || null;
+    if (normalizedWareCode) {
+      const existing = await prisma.product.findFirst({
+        where: { scaleWareCode: normalizedWareCode },
+      });
+      if (existing) {
+        throw new AppError(
+          `Scale ware code "${normalizedWareCode}" is already linked to "${existing.name}"`,
+          409,
+        );
+      }
+    }
+
     // Create product with all fields including SEO
     const product = await prisma.product.create({
       data: {
@@ -435,7 +451,7 @@ export const createProduct = async (
         minOrderQty: minOrderQty ?? null,
         maxOrderQty: maxOrderQty ?? null,
         scaleStep: scaleStep ?? null,
-        scaleWareCode: scaleWareCode?.trim() || null,
+        scaleWareCode: normalizedWareCode,
         scalePresets: scalePresets ?? [],
         // Structured variations (dynamic per-preset pricing + stock)
         variations: incomingVariations.length
@@ -499,7 +515,7 @@ export const updateProduct = async (
     const product = await prisma.product.findUnique({ where: { id } });
     if (!product) throw new NotFoundError("Product not found");
 
-    const { slug, sku, categoryId, variations, ...rest } = req.body;
+    const { slug, sku, categoryId, variations, scaleWareCode, ...rest } = req.body;
 
     // Security: only admins can directly set stockQuantity via this endpoint.
     // Staff and Sales must go through the stock-approval workflow.
@@ -532,6 +548,24 @@ export const updateProduct = async (
         where: { sku, NOT: { id } },
       });
       if (existing) throw new AppError("SKU already in use", 409);
+    }
+
+    // Validate scale ware code if changed — same pattern as slug/sku above.
+    // Not enforced at the database level (see the schema comment on
+    // Product.scaleWareCode for why: Prisma+MongoDB can't create a sparse
+    // unique index, and this field is null on virtually every product).
+    const normalizedWareCode =
+      scaleWareCode !== undefined ? scaleWareCode?.trim() || null : undefined;
+    if (normalizedWareCode && normalizedWareCode !== product.scaleWareCode) {
+      const existing = await prisma.product.findFirst({
+        where: { scaleWareCode: normalizedWareCode, NOT: { id } },
+      });
+      if (existing) {
+        throw new AppError(
+          `Scale ware code "${normalizedWareCode}" is already linked to "${existing.name}"`,
+          409,
+        );
+      }
     }
 
     // ── Variations (structured presets) ─────────────────────────────────────
@@ -590,6 +624,7 @@ export const updateProduct = async (
         ...(slug && { slug }),
         ...(sku && { sku }),
         ...(categoryId && { categoryId }),
+        ...(normalizedWareCode !== undefined && { scaleWareCode: normalizedWareCode }),
       },
       include: { category: true, brand: true, variations: true },
     });
