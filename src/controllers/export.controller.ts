@@ -347,8 +347,8 @@ export const importProductsCSV = async (
       costPrice: row.costPrice ? parseFloat(row.costPrice) : null,
       stockQuantity: parseInt(row.stockQuantity) || 0,
       lowStockThreshold: parseInt(row.lowStockThreshold) || 5,
-      categoryId: row.categoryId,
-      brandId: row.brandId || null,
+      // categoryId/brandId deliberately NOT included here — see the
+      // explicit connect-based handling right before create/update below.
       status: (row.status as any) || "ACTIVE",
       description: row.description || null,
       shortDescription: row.shortDescription || null,
@@ -690,6 +690,32 @@ export const importProductsCSV = async (
         }
 
         const variations = parseVariationsCell(row.variations);
+
+        // category/brand are relations, not plain scalars — Prisma
+        // rejects a bare `categoryId`/`brandId` key on .update() for this
+        // schema ("Unknown argument categoryId. Did you mean category?"),
+        // so they're written via explicit connect syntax instead, kept out
+        // of buildData/pickPresentFields entirely (see note there) and
+        // applied here based on which columns this CSV row actually has.
+        // CREATE and UPDATE need slightly different handling: a brand-new
+        // product with no brandId simply omits the key (no relation set at
+        // all), while clearing an existing product's brand needs an
+        // explicit disconnect rather than just leaving the key out.
+        if (existing) {
+          if (row.categoryId !== undefined) {
+            data.category = { connect: { id: row.categoryId } };
+          }
+          if (row.brandId !== undefined) {
+            data.brand = row.brandId
+              ? { connect: { id: row.brandId } }
+              : { disconnect: true };
+          }
+        } else {
+          // categoryId is required and already validated above (the
+          // "Required fields missing" check at the top of this row).
+          data.category = { connect: { id: row.categoryId } };
+          if (row.brandId) data.brand = { connect: { id: row.brandId } };
+        }
 
         let productId: string;
         if (existing) {

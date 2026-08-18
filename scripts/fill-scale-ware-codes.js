@@ -13,11 +13,20 @@
 // actually apply the change — same review-before-apply workflow as any
 // other bulk CSV edit, nothing silently written straight to the database.
 //
-// Usage:
-//   node scripts/fill-scale-ware-codes.js \
-//     --products path/to/products-export.csv \
-//     --scale path/to/SCALE_GOODS.xlsx \
-//     --out products-with-scale-codes.csv
+// Usage — two ways:
+//
+//   1. Drop-in (easiest): put your products CSV and SCALE_GOODS.xlsx
+//      directly into this scripts/ folder, then just run:
+//        node scripts/fill-scale-ware-codes.js
+//      It auto-detects the .csv and .xlsx files sitting next to it. If
+//      more than one match is found, it uses the most recently modified
+//      and tells you which one (and what else it saw).
+//
+//   2. Explicit paths, from anywhere:
+//        node scripts/fill-scale-ware-codes.js \
+//          --products path/to/products-export.csv \
+//          --scale path/to/SCALE_GOODS.xlsx \
+//          --out products-with-scale-codes.csv
 //
 // Requires the app's product CSV to be a FULL export (Export tab → Export
 // as CSV) — not a partial/hand-trimmed file — since the safest thing is to
@@ -131,20 +140,72 @@ function readScalePlu(filePath) {
   return entries;
 }
 
+// ── Auto-discovery: if --products/--scale aren't given, look for files
+// sitting right next to this script instead of requiring typed-out paths.
+// A .csv in this folder is assumed to be the products export; a .xlsx is
+// assumed to be the scale's PLU export. If more than one candidate of a
+// type is found, the most recently modified one is used (so re-exporting
+// a fresh copy into this folder "just works" without cleaning up the old
+// one first) — but every candidate found is listed either way, so it's
+// obvious which file got picked and why.
+const OUTPUT_FILENAME = "products-with-scale-codes.csv";
+
+function findFileByExtension(ext, exclude = []) {
+  const dir = __dirname;
+  const candidates = fs
+    .readdirSync(dir)
+    .filter((f) => f.toLowerCase().endsWith(ext) && !exclude.includes(f))
+    .map((f) => {
+      const full = path.join(dir, f);
+      return { name: f, full, mtime: fs.statSync(full).mtimeMs };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+
+  if (candidates.length === 0) return null;
+  if (candidates.length > 1) {
+    console.log(
+      `Found ${candidates.length} ${ext} files in scripts/ — using the most recent: ${candidates[0].name}`,
+    );
+    console.log(`  (others: ${candidates.slice(1).map((c) => c.name).join(", ")})`);
+  }
+  return candidates[0].full;
+}
+
 function main() {
   const args = parseArgs();
-  if (!args.products || !args.scale) {
+
+  const productsPath = args.products
+    ? path.resolve(args.products)
+    : findFileByExtension(".csv", [OUTPUT_FILENAME]);
+  const scalePath = args.scale
+    ? path.resolve(args.scale)
+    : findFileByExtension(".xlsx");
+
+  if (!productsPath || !scalePath) {
     console.error(
-      "Usage: node scripts/fill-scale-ware-codes.js --products <products.csv> --scale <SCALE_GOODS.xlsx> [--out <output.csv>] [--force]",
+      !productsPath
+        ? "No .csv file found in scripts/ and no --products path given."
+        : "No .xlsx file found in scripts/ and no --scale path given.",
+    );
+    console.error(
+      "\nEither drop both files directly into the scripts/ folder and run:\n" +
+        "  node scripts/fill-scale-ware-codes.js\n" +
+        "…or point at them explicitly:\n" +
+        "  node scripts/fill-scale-ware-codes.js --products <products.csv> --scale <SCALE_GOODS.xlsx> [--out <output.csv>] [--force]",
     );
     process.exit(1);
   }
 
-  const outPath = args.out || "products-with-scale-codes.csv";
+  const outPath = args.out
+    ? path.resolve(args.out)
+    : path.join(__dirname, OUTPUT_FILENAME);
   const force = !!args.force;
 
-  const products = readProductsCsv(path.resolve(args.products));
-  const scaleEntries = readScalePlu(path.resolve(args.scale));
+  console.log(`Products file: ${productsPath}`);
+  console.log(`Scale file:    ${scalePath}\n`);
+
+  const products = readProductsCsv(productsPath);
+  const scaleEntries = readScalePlu(scalePath);
 
   // Build normalized-name -> code map, flagging any name that appears more
   // than once in the scale's own export (ambiguous — skip rather than guess).

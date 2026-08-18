@@ -551,7 +551,8 @@ export const updateProduct = async (
     const product = await prisma.product.findUnique({ where: { id } });
     if (!product) throw new NotFoundError("Product not found");
 
-    const { slug, sku, categoryId, variations, scaleWareCode, ...rest } = req.body;
+    const { slug, sku, categoryId, brandId, variations, scaleWareCode, ...rest } =
+      req.body;
 
     // Security: only admins can directly set stockQuantity via this endpoint.
     // Staff and Sales must go through the stock-approval workflow.
@@ -624,7 +625,18 @@ export const updateProduct = async (
         ...rest,
         ...(slug && { slug }),
         ...(sku && { sku }),
-        ...(categoryId && { categoryId }),
+        // category/brand are relations — Prisma rejects a bare
+        // `categoryId`/`brandId` scalar on .update() for this schema
+        // ("Unknown argument categoryId. Did you mean category?"), so they
+        // go through explicit connect/disconnect instead of a plain field
+        // assignment. This was silently broken before (any save that
+        // changed a product's category, or cleared its brand, would have
+        // thrown this exact error) — fixed here, and the same fix is
+        // mirrored in the CSV import path in export.controller.ts.
+        ...(categoryId && { category: { connect: { id: categoryId } } }),
+        ...(brandId !== undefined && {
+          brand: brandId ? { connect: { id: brandId } } : { disconnect: true },
+        }),
         ...(normalizedWareCode !== undefined && { scaleWareCode: normalizedWareCode }),
       },
       include: { category: true, brand: true, variations: true },
