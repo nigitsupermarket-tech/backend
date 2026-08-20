@@ -1440,9 +1440,20 @@ export const importScaleGoodsSheet = async (
   next: NextFunction,
 ) => {
   try {
-    if (req.user?.role !== "ADMIN") {
+    const role = req.user?.role;
+    // Same creation-permission tier as CSV import (ADMIN/MANAGER/STAFF —
+    // see canCreate in importProductsCSV). This used to be admin-only,
+    // but now that every row this importer creates always lands at
+    // stockQuantity: 0 / status: DRAFT regardless of who ran it (see the
+    // big comment block above this function), there's nothing left for a
+    // non-admin import to bypass — a draft with zero stock can't be sold
+    // to anyone. Getting it live still requires a separate stock update,
+    // which goes through the normal stock-approval flow like any other
+    // stock change from MANAGER/STAFF.
+    const canCreate = role === "ADMIN" || role === "MANAGER" || role === "STAFF";
+    if (!canCreate) {
       throw new AppError(
-        "Only admins can bulk-create products from a scale sheet",
+        "Your role can't bulk-create products from a scale sheet",
         403,
       );
     }
@@ -1485,6 +1496,14 @@ export const importScaleGoodsSheet = async (
     if (isNaN(scaleStep) || scaleStep < 0) {
       throw new AppError("scaleStep must be a positive number", 400);
     }
+
+    // Needed for ImportBatch attribution below — this importer is no
+    // longer admin-only, so the acting user's real name matters for the
+    // "Recent imports" list to be legible.
+    const actingUser = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+      select: { name: true },
+    });
 
     let workbook: XLSX.WorkBook;
     try {
@@ -1707,7 +1726,7 @@ export const importScaleGoodsSheet = async (
           type: "SCALE_GOODS",
           fileName: req.file.originalname,
           performedBy: req.user!.userId,
-          performedByName: "Admin",
+          performedByName: actingUser?.name || "Unknown",
           performedByRole: req.user!.role,
           totalRows: parsed.length,
           createdCount: batchItems.length,
