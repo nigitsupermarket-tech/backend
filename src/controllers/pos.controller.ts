@@ -1881,8 +1881,27 @@ export const resolveScaleBarcode = async (
     });
 
     if (!product) {
+      // The scaleWareCode itself might be right but the match still fails
+      // on isScalable/status — a bare 404 gives no way to tell those apart
+      // from "nothing has this code at all". Look up by code alone (no
+      // other filters) so the error can say exactly what's actually wrong.
+      const anyMatch = await prisma.product.findFirst({
+        where: { scaleWareCode: wareCode },
+        select: { id: true, name: true, isScalable: true, status: true },
+      });
+
+      if (!anyMatch) {
+        throw new NotFoundError(
+          `No product has scale code "${wareCode}" set at all. Set its "Scale Ware Code" in the product editor to match what the scale prints.`,
+        );
+      }
+      if (!anyMatch.isScalable) {
+        throw new NotFoundError(
+          `"${anyMatch.name}" has scale code "${wareCode}" set, but isn't marked as a scalable product — check "This product is sold by measurement/scale" on its Scale/Weight tab and save.`,
+        );
+      }
       throw new NotFoundError(
-        `No product is linked to scale code ${wareCode}. Set its "Scale Ware Code" in the product editor to match what the scale prints.`,
+        `"${anyMatch.name}" has scale code "${wareCode}" set, but its status is ${anyMatch.status}, not ACTIVE — only active products can be scanned at checkout.`,
       );
     }
 
