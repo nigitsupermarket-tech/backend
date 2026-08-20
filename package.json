@@ -5,7 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "nodemon src/server.ts",
-       "publish:scale-goods": "ts-node scripts/publish-scale-goods.ts",
+    "publish:scale-goods": "ts-node scripts/publish-scale-goods.ts",
     "postinstall": "prisma generate",
     "build": "prisma generate && tsc",
     "vercel-build": "prisma generate && tsc",
@@ -16,6 +16,7 @@
     "prisma:studio": "prisma studio",
     "prisma:seed": "ts-node prisma/seed.ts",
     "backfill:order-stock": "ts-node scripts/backfill-order-stock.ts",
+    "backfill:scalable-flag": "ts-node scripts/backfill-scalable-flag.ts",
     "fix-cart-indexes": "ts-node scripts/fix-cart-indexes.ts"
   },
   "keywords": [

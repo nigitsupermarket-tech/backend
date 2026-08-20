@@ -354,6 +354,23 @@ export const exportProductsPDF = async (
 // undone later from Admin → Products → Import/Export → Recent Imports —
 // but only while nothing has depended on it yet (see isBatchUndoable /
 // undoImportBatch below).
+//
+// Parses a CSV cell into a boolean, tolerant of the ways spreadsheet
+// software mangles a plain "true"/"false" the moment a human opens and
+// re-saves the file: Excel/Google Sheets auto-capitalize recognized
+// booleans to "TRUE"/"FALSE", copy-paste can leave stray whitespace, and
+// "1"/"0" or "yes"/"no" are common manual substitutes. The old exact
+// `row.X === "true"` comparison silently read every one of those as
+// false — a product could have every other scalable field (unit, price
+// per unit, step) correctly populated and still save as isScalable:
+// false, with nothing in the response to say why, because the row LOOKED
+// like it said true.
+function parseCsvBool(raw: string | undefined | null): boolean {
+  if (!raw) return false;
+  const v = String(raw).trim().toLowerCase();
+  return v === "true" || v === "1" || v === "yes";
+}
+
 export const importProductsCSV = async (
   req: AuthRequest,
   res: Response,
@@ -413,9 +430,9 @@ export const importProductsCSV = async (
       // correctly stays `|| null`.
       description: row.description || "",
       shortDescription: row.shortDescription || null,
-      isFeatured: row.isFeatured === "true",
-      isNewArrival: row.isNewArrival === "true",
-      isOnPromotion: row.isOnPromotion === "true",
+      isFeatured: parseCsvBool(row.isFeatured),
+      isNewArrival: parseCsvBool(row.isNewArrival),
+      isOnPromotion: parseCsvBool(row.isOnPromotion),
       tags: row.tags ? row.tags.split("|").filter(Boolean) : [],
       images: row.images ? row.images.split("|").filter(Boolean) : [],
       barcode: row.barcode || null,
@@ -423,17 +440,17 @@ export const importProductsCSV = async (
       unitsPerCarton: row.unitsPerCarton ? parseInt(row.unitsPerCarton) : null,
       origin: row.origin || null,
       weight: row.weight ? parseFloat(row.weight) : null,
-      isHalal: row.isHalal === "true",
-      isOrganic: row.isOrganic === "true",
-      isKosher: row.isKosher === "true",
-      isVegan: row.isVegan === "true",
-      isGlutenFree: row.isGlutenFree === "true",
+      isHalal: parseCsvBool(row.isHalal),
+      isOrganic: parseCsvBool(row.isOrganic),
+      isKosher: parseCsvBool(row.isKosher),
+      isVegan: parseCsvBool(row.isVegan),
+      isGlutenFree: parseCsvBool(row.isGlutenFree),
       naifdaNumber: row.naifdaNumber || null,
       storageInstructions: row.storageInstructions || null,
       ingredients: row.ingredients || null,
       allergens: row.allergens ? row.allergens.split("|").filter(Boolean) : [],
       // ── Scalable / weighted product ──
-      isScalable: row.isScalable === "true",
+      isScalable: parseCsvBool(row.isScalable),
       scaleUnit: row.scaleUnit || null,
       pricePerUnit: row.pricePerUnit ? parseFloat(row.pricePerUnit) : null,
       minOrderQty: row.minOrderQty ? parseFloat(row.minOrderQty) : null,
@@ -634,11 +651,11 @@ export const importProductsCSV = async (
             if (row.shortDescription !== undefined)
               safeData.shortDescription = row.shortDescription || null;
             if (row.isFeatured !== undefined)
-              safeData.isFeatured = row.isFeatured === "true";
+              safeData.isFeatured = parseCsvBool(row.isFeatured);
             if (row.isNewArrival !== undefined)
-              safeData.isNewArrival = row.isNewArrival === "true";
+              safeData.isNewArrival = parseCsvBool(row.isNewArrival);
             if (row.isOnPromotion !== undefined)
-              safeData.isOnPromotion = row.isOnPromotion === "true";
+              safeData.isOnPromotion = parseCsvBool(row.isOnPromotion);
             if (row.tags) safeData.tags = row.tags.split("|").filter(Boolean);
             if (row.barcode !== undefined)
               safeData.barcode = row.barcode || null;
@@ -652,15 +669,15 @@ export const importProductsCSV = async (
             if (row.weight !== undefined)
               safeData.weight = row.weight ? parseFloat(row.weight) : null;
             if (row.isHalal !== undefined)
-              safeData.isHalal = row.isHalal === "true";
+              safeData.isHalal = parseCsvBool(row.isHalal);
             if (row.isOrganic !== undefined)
-              safeData.isOrganic = row.isOrganic === "true";
+              safeData.isOrganic = parseCsvBool(row.isOrganic);
             if (row.isKosher !== undefined)
-              safeData.isKosher = row.isKosher === "true";
+              safeData.isKosher = parseCsvBool(row.isKosher);
             if (row.isVegan !== undefined)
-              safeData.isVegan = row.isVegan === "true";
+              safeData.isVegan = parseCsvBool(row.isVegan);
             if (row.isGlutenFree !== undefined)
-              safeData.isGlutenFree = row.isGlutenFree === "true";
+              safeData.isGlutenFree = parseCsvBool(row.isGlutenFree);
             if (row.naifdaNumber !== undefined)
               safeData.naifdaNumber = row.naifdaNumber || null;
             if (row.storageInstructions !== undefined)
@@ -675,7 +692,7 @@ export const importProductsCSV = async (
             // excluded here — structural/nested changes stay admin-only,
             // same boundary as new-product creation just above)
             if (row.isScalable !== undefined)
-              safeData.isScalable = row.isScalable === "true";
+              safeData.isScalable = parseCsvBool(row.isScalable);
             if (row.scaleUnit !== undefined)
               safeData.scaleUnit = row.scaleUnit || null;
             if (row.pricePerUnit !== undefined)
