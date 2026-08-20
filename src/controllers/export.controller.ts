@@ -120,6 +120,18 @@ const PRODUCT_CSV_COLUMNS = [
   // the exact same variations (matched by "id" when present, so editing a
   // variation's price in the CSV and re-importing updates it in place
   // rather than creating a duplicate).
+  //
+  // Stock interaction with the `stockQuantity` column above: that column
+  // is ALWAYS the shared pool, applied first. If this cell changes a
+  // variation's OWN dedicated stock count (a preset's `stockQuantity`
+  // field inside the JSON), that change is then reconciled on top —
+  // pulling from or returning to the shared pool by the equivalent
+  // amount, exactly like editing it by hand in the product form (see
+  // applyProductVariations in product.controller.ts). Don't set both a
+  // new shared `stockQuantity` AND a new dedicated variation count in the
+  // same row expecting them to be independent totals — the variation
+  // change is always relative to whatever the shared column in this same
+  // row just set it to.
   "variations",
 ] as const;
 
@@ -504,6 +516,20 @@ export const importProductsCSV = async (
       : null;
     if (!isAdmin && !requestingUser) throw new AppError("User not found", 404);
 
+    // Needed for applyProductVariations' shared-pool transfer log
+    // attribution regardless of role (requestingUser above is only
+    // populated for non-admins).
+    const actingUser = requestingUser
+      ? { id: req.user!.userId, name: requestingUser.name }
+      : { id: req.user!.userId, name: undefined as string | undefined };
+    if (isAdmin) {
+      const admin = await prisma.user.findUnique({
+        where: { id: req.user!.userId },
+        select: { name: true },
+      });
+      actingUser.name = admin?.name;
+    }
+
     // Strips down a full Product record to a plain object safe to hand back
     // to prisma.update() later for undo — drops id/timestamps (managed by
     // Prisma) and the relation-typed categoryId/brandId, which Prisma
@@ -584,7 +610,7 @@ export const importProductsCSV = async (
             const variations = parseVariationsCell(row.variations);
             await prisma.product.update({ where: { sku: row.sku }, data });
             if (variations !== undefined) {
-              await applyProductVariations(existing.id, variations);
+              await applyProductVariations(existing.id, variations, actingUser);
             }
           } else {
             // Non-stock fields update immediately; stock handled above.
@@ -761,7 +787,7 @@ export const importProductsCSV = async (
         const created = await prisma.product.create({ data: fullData });
 
         if (variations !== undefined) {
-          await applyProductVariations(created.id, variations);
+          await applyProductVariations(created.id, variations, actingUser);
         }
 
         let stockApprovalRequestId: string | undefined;

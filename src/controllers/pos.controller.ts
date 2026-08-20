@@ -6,6 +6,11 @@ import { AuthRequest } from "../middlewares/auth.middleware";
 import { log as logActivity } from "../utils/activityLogger";
 import { sendAdminVoidRequestEmail } from "../services/email.service";
 import {
+  runWithRetry,
+  notifyOversold,
+  type OversoldEvent,
+} from "../lib/stockSafety";
+import {
   findActiveVariation,
   resolveVariationLine,
   assertVariationStock,
@@ -185,136 +190,273 @@ export const createPOSOrder = async (
     // of sequentially, cutting wall-clock time roughly in half for
     // multi-item carts, and (2) explicitly raise the transaction's timeout
     // and maxWait as a safety margin for larger orders / slower networks.
-    const posOrder = await prisma.$transaction(
-      async (tx) => {
-        const order = await tx.pOSOrder.create({
-          data: {
-            posOrderNumber,
-            processedById: staffId,
-            status: "COMPLETED",
-            sessionId: activeSessionId ?? null,
-            subtotal,
-            discountAmount: discountAmount || 0,
-            discountCode: discountCode || null,
-            total,
-            paymentMethod,
-            amountTendered: amountTendered ?? null,
-            changeGiven: changeGiven ?? null,
-            splitPayments: splitPayments ?? undefined,
-            paymentReference: paymentReference ?? null,
-            customerName: customerName ?? null,
-            customerPhone: customerPhone ?? null,
-            notes: notes ?? null,
-            receiptNumber,
-            completedAt: new Date(),
-            items: {
-              create: preparedItems,
+    //
+    // OVERSELLING SAFETY: stock was validated above, before this
+    // transaction started — but two POS terminals (or a POS sale racing an
+    // online order's payment confirmation) can both pass that check before
+    // either one writes. Each decrement below is now a conditional
+    // `updateMany` guarded on `stockQuantity: { gte: quantity }`, wrapped
+    // in `runWithRetry` for MongoDB's transaction write-conflict semantics
+    // — see lib/stockSafety.ts for the full explanation. A sale that loses
+    // that race is already rung up and paid for at the register, so it's
+    // floored at 0 and reported via `notifyOversold` rather than rejected.
+    const { order: posOrder, events: oversoldEvents } = await runWithRetry(() =>
+      prisma.$transaction(
+        async (tx) => {
+          const order = await tx.pOSOrder.create({
+            data: {
+              posOrderNumber,
+              processedById: staffId,
+              status: "COMPLETED",
+              sessionId: activeSessionId ?? null,
+              subtotal,
+              discountAmount: discountAmount || 0,
+              discountCode: discountCode || null,
+              total,
+              paymentMethod,
+              amountTendered: amountTendered ?? null,
+              changeGiven: changeGiven ?? null,
+              splitPayments: splitPayments ?? undefined,
+              paymentReference: paymentReference ?? null,
+              customerName: customerName ?? null,
+              customerPhone: customerPhone ?? null,
+              notes: notes ?? null,
+              receiptNumber,
+              completedAt: new Date(),
+              items: {
+                create: preparedItems,
+              },
             },
-          },
-          include: { items: true },
-        });
+            include: { items: true },
+          });
 
-        // Run all per-item stock updates + inventory logs concurrently
-        // instead of one-by-one — this is the main time saver for
-        // multi-item carts.
-        await Promise.all(
-          validatedItems
-            .filter(({ product }) => product.trackInventory)
-            .map(({ product, item, variation, resolved }) => {
-              if (variation && resolved) {
-                if (resolved.stockMode === "DEDICATED") {
-                  // Dedicated stock — decrement the variation's own pack
-                  // count, completely independent of the shared pool.
-                  const prevQty = variation.stockQuantity ?? 0;
-                  return Promise.all([
-                    tx.productVariation.update({
-                      where: { id: variation.id },
-                      data: { stockQuantity: { decrement: resolved.packCount } },
-                    }),
-                    tx.inventoryLog.create({
+          // Run all per-item stock updates + inventory logs concurrently
+          // instead of one-by-one — this is the main time saver for
+          // multi-item carts. Each returns an OversoldEvent if its guarded
+          // decrement lost the race, or null if it succeeded normally.
+          const events = (
+            await Promise.all(
+              validatedItems
+                .filter(({ product }) => product.trackInventory)
+                .map(
+                  async ({
+                    product,
+                    item,
+                    variation,
+                    resolved,
+                  }): Promise<OversoldEvent | null> => {
+                    if (variation && resolved) {
+                      if (resolved.stockMode === "DEDICATED") {
+                        // Dedicated stock — decrement the variation's own pack
+                        // count, completely independent of the shared pool.
+                        const prevQty = variation.stockQuantity ?? 0;
+                        const result = await tx.productVariation.updateMany({
+                          where: {
+                            id: variation.id,
+                            stockQuantity: { gte: resolved.packCount },
+                          },
+                          data: {
+                            stockQuantity: { decrement: resolved.packCount },
+                          },
+                        });
+                        if (result.count === 0) {
+                          await tx.productVariation.update({
+                            where: { id: variation.id },
+                            data: { stockQuantity: 0 },
+                          });
+                          const shortfall =
+                            resolved.packCount - Math.max(0, prevQty);
+                          await tx.inventoryLog.create({
+                            data: {
+                              productId: product.id,
+                              type: "OVERSOLD",
+                              quantity: -resolved.packCount,
+                              previousQty: prevQty,
+                              newQty: 0,
+                              reason: `⚠ Oversold — ${variation.label} (POS sale ${posOrderNumber}, only ${Math.max(0, prevQty)} of ${resolved.packCount} available)`,
+                              reference: posOrderNumber,
+                              variationId: variation.id,
+                              variationLabel: variation.label,
+                              stockMode: "DEDICATED",
+                              performedBy: staffId,
+                            },
+                          });
+                          return {
+                            productId: product.id,
+                            productName: product.name,
+                            sku: product.sku,
+                            shortfall: Math.max(0, shortfall),
+                            unit: "pack(s)",
+                            variationLabel: variation.label,
+                            reference: posOrderNumber,
+                            channel: "POS",
+                          };
+                        }
+                        await tx.inventoryLog.create({
+                          data: {
+                            productId: product.id,
+                            type: "POS_SALE",
+                            quantity: -resolved.packCount,
+                            previousQty: prevQty,
+                            newQty: prevQty - resolved.packCount,
+                            reason: `POS sale — ${variation.label}`,
+                            reference: posOrderNumber,
+                            variationId: variation.id,
+                            variationLabel: variation.label,
+                            stockMode: "DEDICATED",
+                            performedBy: staffId,
+                          },
+                        });
+                        return null;
+                      }
+                      // Shared stock — deduct the equivalent base quantity (in
+                      // scaleUnit) from the product's shared pool.
+                      const sharedResult = await tx.product.updateMany({
+                        where: {
+                          id: product.id,
+                          stockQuantity: { gte: resolved.baseQty },
+                        },
+                        data: {
+                          stockQuantity: { decrement: resolved.baseQty },
+                          salesCount: { increment: resolved.packCount },
+                        },
+                      });
+                      if (sharedResult.count === 0) {
+                        await tx.product.update({
+                          where: { id: product.id },
+                          data: {
+                            stockQuantity: 0,
+                            salesCount: { increment: resolved.packCount },
+                          },
+                        });
+                        const shortfall =
+                          resolved.baseQty - Math.max(0, product.stockQuantity);
+                        await tx.inventoryLog.create({
+                          data: {
+                            productId: product.id,
+                            type: "OVERSOLD",
+                            quantity: -resolved.baseQty,
+                            previousQty: product.stockQuantity,
+                            newQty: 0,
+                            reason: `⚠ Oversold — ${variation.label} (POS sale ${posOrderNumber}, only ${Math.max(0, product.stockQuantity)} of ${resolved.baseQty} available)`,
+                            reference: posOrderNumber,
+                            variationId: variation.id,
+                            variationLabel: variation.label,
+                            stockMode: "SHARED",
+                            performedBy: staffId,
+                          },
+                        });
+                        return {
+                          productId: product.id,
+                          productName: product.name,
+                          sku: product.sku,
+                          shortfall: Math.max(0, shortfall),
+                          unit: product.scaleUnit || "unit(s)",
+                          variationLabel: variation.label,
+                          reference: posOrderNumber,
+                          channel: "POS",
+                        };
+                      }
+                      await tx.inventoryLog.create({
+                        data: {
+                          productId: product.id,
+                          type: "POS_SALE",
+                          quantity: -resolved.baseQty,
+                          previousQty: product.stockQuantity,
+                          newQty: product.stockQuantity - resolved.baseQty,
+                          reason: `POS sale — ${variation.label}`,
+                          reference: posOrderNumber,
+                          variationId: variation.id,
+                          variationLabel: variation.label,
+                          stockMode: "SHARED",
+                          performedBy: staffId,
+                        },
+                      });
+                      return null;
+                    }
+
+                    // Legacy fixed / free-form custom-weight line — unchanged
+                    // aside from the same guarded-decrement treatment.
+                    const result = await tx.product.updateMany({
+                      where: {
+                        id: product.id,
+                        stockQuantity: { gte: item.quantity },
+                      },
+                      data: {
+                        stockQuantity: { decrement: item.quantity },
+                        salesCount: { increment: item.quantity },
+                      },
+                    });
+                    if (result.count === 0) {
+                      await tx.product.update({
+                        where: { id: product.id },
+                        data: {
+                          stockQuantity: 0,
+                          salesCount: { increment: item.quantity },
+                        },
+                      });
+                      const shortfall =
+                        item.quantity - Math.max(0, product.stockQuantity);
+                      await tx.inventoryLog.create({
+                        data: {
+                          productId: product.id,
+                          type: "OVERSOLD",
+                          quantity: -item.quantity,
+                          previousQty: product.stockQuantity,
+                          newQty: 0,
+                          reason: `⚠ Oversold (POS sale ${posOrderNumber}, only ${Math.max(0, product.stockQuantity)} of ${item.quantity} available)`,
+                          reference: posOrderNumber,
+                          performedBy: staffId,
+                        },
+                      });
+                      return {
+                        productId: product.id,
+                        productName: product.name,
+                        sku: product.sku,
+                        shortfall: Math.max(0, shortfall),
+                        unit: product.isScalable
+                          ? product.scaleUnit || "unit(s)"
+                          : "unit(s)",
+                        variationLabel: null,
+                        reference: posOrderNumber,
+                        channel: "POS",
+                      };
+                    }
+                    await tx.inventoryLog.create({
                       data: {
                         productId: product.id,
                         type: "POS_SALE",
-                        quantity: -resolved.packCount,
-                        previousQty: prevQty,
-                        newQty: prevQty - resolved.packCount,
-                        reason: `POS sale — ${variation.label}`,
+                        quantity: -item.quantity,
+                        previousQty: product.stockQuantity,
+                        newQty: product.stockQuantity - item.quantity,
+                        reason: "POS sale",
                         reference: posOrderNumber,
-                        variationId: variation.id,
-                        variationLabel: variation.label,
-                        stockMode: "DEDICATED",
                         performedBy: staffId,
                       },
-                    }),
-                  ]);
-                }
-                // Shared stock — deduct the equivalent base quantity (in
-                // scaleUnit) from the product's shared pool.
-                return Promise.all([
-                  tx.product.update({
-                    where: { id: product.id },
-                    data: {
-                      stockQuantity: { decrement: resolved.baseQty },
-                      salesCount: { increment: resolved.packCount },
-                    },
-                  }),
-                  tx.inventoryLog.create({
-                    data: {
-                      productId: product.id,
-                      type: "POS_SALE",
-                      quantity: -resolved.baseQty,
-                      previousQty: product.stockQuantity,
-                      newQty: product.stockQuantity - resolved.baseQty,
-                      reason: `POS sale — ${variation.label}`,
-                      reference: posOrderNumber,
-                      variationId: variation.id,
-                      variationLabel: variation.label,
-                      stockMode: "SHARED",
-                      performedBy: staffId,
-                    },
-                  }),
-                ]);
-              }
-
-              // Legacy fixed / free-form custom-weight line — unchanged.
-              return Promise.all([
-                tx.product.update({
-                  where: { id: product.id },
-                  data: {
-                    stockQuantity: { decrement: item.quantity },
-                    salesCount: { increment: item.quantity },
+                    });
+                    return null;
                   },
-                }),
-                tx.inventoryLog.create({
-                  data: {
-                    productId: product.id,
-                    type: "POS_SALE",
-                    quantity: -item.quantity,
-                    previousQty: product.stockQuantity,
-                    newQty: product.stockQuantity - item.quantity,
-                    reason: "POS sale",
-                    reference: posOrderNumber,
-                    performedBy: staffId,
-                  },
-                }),
-              ]);
-            }),
-        );
+                ),
+            )
+          ).filter((e): e is OversoldEvent => e !== null);
 
-        if (discountCode) {
-          await tx.discount.updateMany({
-            where: { code: discountCode.toUpperCase() },
-            data: { usageCount: { increment: 1 } },
-          });
-        }
+          if (discountCode) {
+            await tx.discount.updateMany({
+              where: { code: discountCode.toUpperCase() },
+              data: { usageCount: { increment: 1 } },
+            });
+          }
 
-        return order;
-      },
-      {
-        maxWait: 15_000, // time allowed waiting for a transaction slot
-        timeout: 40_000, // time allowed for the transaction body to run
-      },
+          return { order, events };
+        },
+        {
+          maxWait: 15_000, // time allowed waiting for a transaction slot
+          timeout: 40_000, // time allowed for the transaction body to run
+        },
+      ),
     );
+
+    await notifyOversold(oversoldEvents);
 
     logActivity({
       userId: req.user?.userId,
@@ -452,135 +594,109 @@ const executeVoidOrder = async (
   reason: string | undefined,
   performedBy: string | undefined,
 ) => {
-    // Fetch the order (no include needed here — we get items inside tx below)
-    const order = await prisma.pOSOrder.findUnique({ where: { id } });
-    if (!order) throw new NotFoundError("POS order not found");
-    if (order.status === "VOIDED") {
-      throw new AppError("Order is already voided", 400);
-    }
-    if (order.status === "REFUNDED") {
-      throw new AppError("Cannot void a refunded order", 400);
-    }
-    // Only COMPLETED orders have stock deducted, so only restore stock for those
-    const restoreStock = order.status === "COMPLETED";
+  // Fetch the order (no include needed here — we get items inside tx below)
+  const order = await prisma.pOSOrder.findUnique({ where: { id } });
+  if (!order) throw new NotFoundError("POS order not found");
+  if (order.status === "VOIDED") {
+    throw new AppError("Order is already voided", 400);
+  }
+  if (order.status === "REFUNDED") {
+    throw new AppError("Cannot void a refunded order", 400);
+  }
+  // Only COMPLETED orders have stock deducted, so only restore stock for those
+  const restoreStock = order.status === "COMPLETED";
 
-    // PERF FIX: the per-item `product.findUnique` used to happen *inside*
-    // the transaction, adding a third round trip per item on top of the
-    // update + inventory log — on a slow connection (Mongo Atlas + Nigeria
-    // latency) that third read-per-item was tipping larger orders over the
-    // transaction timeout ("Transaction already closed" / batch query on an
-    // expired transaction). Reads don't need transactional isolation here,
-    // so they're done up front, and the transaction body only does the
-    // writes that actually need to be atomic.
-    const orderItems = restoreStock
-      ? await prisma.pOSOrderItem.findMany({ where: { posOrderId: id } })
-      : [];
-    const products = orderItems.length
-      ? await prisma.product.findMany({
-          where: { id: { in: orderItems.map((i) => i.productId) } },
-        })
-      : [];
-    const productMap = new Map(products.map((p) => [p.id, p]));
+  // PERF FIX: the per-item `product.findUnique` used to happen *inside*
+  // the transaction, adding a third round trip per item on top of the
+  // update + inventory log — on a slow connection (Mongo Atlas + Nigeria
+  // latency) that third read-per-item was tipping larger orders over the
+  // transaction timeout ("Transaction already closed" / batch query on an
+  // expired transaction). Reads don't need transactional isolation here,
+  // so they're done up front, and the transaction body only does the
+  // writes that actually need to be atomic.
+  const orderItems = restoreStock
+    ? await prisma.pOSOrderItem.findMany({ where: { posOrderId: id } })
+    : [];
+  const products = orderItems.length
+    ? await prisma.product.findMany({
+        where: { id: { in: orderItems.map((i) => i.productId) } },
+      })
+    : [];
+  const productMap = new Map(products.map((p) => [p.id, p]));
 
-    // For variation lines we need the variation's own quantity-per-pack (to
-    // convert a pack count back into a shared-pool base quantity) and its
-    // current dedicated stock (if any) to restore correctly.
-    const variationIds = orderItems
-      .filter((i) => i.variationId)
-      .map((i) => i.variationId as string);
-    const variations = variationIds.length
-      ? await prisma.productVariation.findMany({
-          where: { id: { in: variationIds } },
-        })
-      : [];
-    const variationMap = new Map(variations.map((v) => [v.id, v]));
+  // For variation lines we need the variation's own quantity-per-pack (to
+  // convert a pack count back into a shared-pool base quantity) and its
+  // current dedicated stock (if any) to restore correctly.
+  const variationIds = orderItems
+    .filter((i) => i.variationId)
+    .map((i) => i.variationId as string);
+  const variations = variationIds.length
+    ? await prisma.productVariation.findMany({
+        where: { id: { in: variationIds } },
+      })
+    : [];
+  const variationMap = new Map(variations.map((v) => [v.id, v]));
 
-    await prisma.$transaction(
-      async (tx) => {
-        // 1. Mark voided
-        await tx.pOSOrder.update({
-          where: { id },
-          data: {
-            status: "VOIDED",
-            voidedAt: new Date(),
-            notes: reason ?? order.notes,
-          },
-        });
+  await prisma.$transaction(
+    async (tx) => {
+      // 1. Mark voided
+      await tx.pOSOrder.update({
+        where: { id },
+        data: {
+          status: "VOIDED",
+          voidedAt: new Date(),
+          notes: reason ?? order.notes,
+        },
+      });
 
-        // 2. Restore stock — only for COMPLETED orders (hold/suspended
-        //    orders never had stock deducted, so no restoration needed).
-        if (restoreStock && orderItems.length > 0) {
-          await Promise.all(
-            orderItems.map((item) => {
-              const product = productMap.get(item.productId);
-              if (!product) return Promise.resolve();
+      // 2. Restore stock — only for COMPLETED orders (hold/suspended
+      //    orders never had stock deducted, so no restoration needed).
+      if (restoreStock && orderItems.length > 0) {
+        await Promise.all(
+          orderItems.map((item) => {
+            const product = productMap.get(item.productId);
+            if (!product) return Promise.resolve();
 
-              if (item.variationId) {
-                const variation = variationMap.get(item.variationId);
-                const label = item.variationLabel || variation?.label || "variation";
+            if (item.variationId) {
+              const variation = variationMap.get(item.variationId);
+              const label =
+                item.variationLabel || variation?.label || "variation";
 
-                if (item.stockMode === "DEDICATED" && variation) {
-                  const prevQty = variation.stockQuantity ?? 0;
-                  return Promise.all([
-                    tx.productVariation.update({
-                      where: { id: item.variationId as string },
-                      data: { stockQuantity: { increment: item.quantity } },
-                    }),
-                    tx.inventoryLog.create({
-                      data: {
-                        productId: item.productId,
-                        type: "RETURN",
-                        quantity: item.quantity,
-                        previousQty: prevQty,
-                        newQty: prevQty + item.quantity,
-                        reason: `POS void: ${reason || "no reason"} — ${label}`,
-                        reference: order.posOrderNumber,
-                        variationId: item.variationId,
-                        variationLabel: label,
-                        stockMode: "DEDICATED",
-                        performedBy: performedBy,
-                      },
-                    }),
-                  ]);
-                }
-
-                // SHARED mode — item.quantity is a PACK COUNT, so convert
-                // back to the base scaleUnit amount before restoring.
-                const baseQty = variation
-                  ? variation.quantity * item.quantity
-                  : item.quantity;
+              if (item.stockMode === "DEDICATED" && variation) {
+                const prevQty = variation.stockQuantity ?? 0;
                 return Promise.all([
-                  tx.product.update({
-                    where: { id: item.productId },
-                    data: {
-                      stockQuantity: { increment: baseQty },
-                      salesCount: { decrement: item.quantity },
-                    },
+                  tx.productVariation.update({
+                    where: { id: item.variationId as string },
+                    data: { stockQuantity: { increment: item.quantity } },
                   }),
                   tx.inventoryLog.create({
                     data: {
                       productId: item.productId,
                       type: "RETURN",
-                      quantity: baseQty,
-                      previousQty: product.stockQuantity,
-                      newQty: product.stockQuantity + baseQty,
+                      quantity: item.quantity,
+                      previousQty: prevQty,
+                      newQty: prevQty + item.quantity,
                       reason: `POS void: ${reason || "no reason"} — ${label}`,
                       reference: order.posOrderNumber,
                       variationId: item.variationId,
                       variationLabel: label,
-                      stockMode: "SHARED",
+                      stockMode: "DEDICATED",
                       performedBy: performedBy,
                     },
                   }),
                 ]);
               }
 
-              // Legacy fixed / free-form custom-weight line — unchanged.
+              // SHARED mode — item.quantity is a PACK COUNT, so convert
+              // back to the base scaleUnit amount before restoring.
+              const baseQty = variation
+                ? variation.quantity * item.quantity
+                : item.quantity;
               return Promise.all([
                 tx.product.update({
                   where: { id: item.productId },
                   data: {
-                    stockQuantity: { increment: item.quantity },
+                    stockQuantity: { increment: baseQty },
                     salesCount: { decrement: item.quantity },
                   },
                 }),
@@ -588,26 +704,53 @@ const executeVoidOrder = async (
                   data: {
                     productId: item.productId,
                     type: "RETURN",
-                    quantity: item.quantity,
+                    quantity: baseQty,
                     previousQty: product.stockQuantity,
-                    newQty: product.stockQuantity + item.quantity,
-                    reason: `POS void: ${reason || "no reason"}`,
+                    newQty: product.stockQuantity + baseQty,
+                    reason: `POS void: ${reason || "no reason"} — ${label}`,
                     reference: order.posOrderNumber,
+                    variationId: item.variationId,
+                    variationLabel: label,
+                    stockMode: "SHARED",
                     performedBy: performedBy,
                   },
                 }),
               ]);
-            }),
-          );
-        }
-      },
-      {
-        maxWait: 15_000,
-        timeout: 40_000, // headroom for larger orders on slower connections
-      },
-    );
+            }
 
-    return order;
+            // Legacy fixed / free-form custom-weight line — unchanged.
+            return Promise.all([
+              tx.product.update({
+                where: { id: item.productId },
+                data: {
+                  stockQuantity: { increment: item.quantity },
+                  salesCount: { decrement: item.quantity },
+                },
+              }),
+              tx.inventoryLog.create({
+                data: {
+                  productId: item.productId,
+                  type: "RETURN",
+                  quantity: item.quantity,
+                  previousQty: product.stockQuantity,
+                  newQty: product.stockQuantity + item.quantity,
+                  reason: `POS void: ${reason || "no reason"}`,
+                  reference: order.posOrderNumber,
+                  performedBy: performedBy,
+                },
+              }),
+            ]);
+          }),
+        );
+      }
+    },
+    {
+      maxWait: 15_000,
+      timeout: 40_000, // headroom for larger orders on slower connections
+    },
+  );
+
+  return order;
 };
 
 // ── PUT /api/v1/pos/orders/:id/void ──────────────────────────────────────────
@@ -715,7 +858,8 @@ export const requestVoidOrder = async (
     prisma.siteSetting
       .findFirst()
       .then((cfg) => {
-        const adminEmails: string[] = (cfg as any)?.adminNotificationEmails ?? [];
+        const adminEmails: string[] =
+          (cfg as any)?.adminNotificationEmails ?? [];
         if (adminEmails.length === 0) return;
         sendAdminVoidRequestEmail(adminEmails, {
           posOrderNumber: order.posOrderNumber,
@@ -786,7 +930,9 @@ export const getVoidRequests = async (
     if (search) {
       where.OR = [
         { posOrderNumber: { contains: search as string, mode: "insensitive" } },
-        { requestedByName: { contains: search as string, mode: "insensitive" } },
+        {
+          requestedByName: { contains: search as string, mode: "insensitive" },
+        },
       ];
     }
 
@@ -847,7 +993,9 @@ export const approveVoidRequest = async (
     const id = req.params.id as string;
     const { reviewNote } = req.body;
 
-    const request = await prisma.voidApprovalRequest.findUnique({ where: { id } });
+    const request = await prisma.voidApprovalRequest.findUnique({
+      where: { id },
+    });
     if (!request) throw new NotFoundError("Void request not found");
     if (request.status !== "PENDING") {
       throw new AppError("Request is no longer pending", 400);
@@ -860,7 +1008,11 @@ export const approveVoidRequest = async (
     // Perform the actual void — will throw (and leave the request PENDING)
     // if the order was already voided/refunded by some other path since
     // the request was made.
-    await executeVoidOrder(request.posOrderId, request.reason, req.user!.userId);
+    await executeVoidOrder(
+      request.posOrderId,
+      request.reason,
+      req.user!.userId,
+    );
 
     const updated = await prisma.voidApprovalRequest.update({
       where: { id },
@@ -902,7 +1054,9 @@ export const rejectVoidRequest = async (
     const id = req.params.id as string;
     const { reviewNote } = req.body;
 
-    const request = await prisma.voidApprovalRequest.findUnique({ where: { id } });
+    const request = await prisma.voidApprovalRequest.findUnique({
+      where: { id },
+    });
     if (!request) throw new NotFoundError("Void request not found");
     if (request.status !== "PENDING") {
       throw new AppError("Request is no longer pending", 400);
@@ -1512,7 +1666,9 @@ export const resumePOSOrder = async (
       if (!product.trackInventory) continue;
 
       if (item.variationId) {
-        const variation = product.variations.find((v) => v.id === item.variationId);
+        const variation = product.variations.find(
+          (v) => v.id === item.variationId,
+        );
         if (!variation || !variation.isActive) {
           throw new AppError(
             `Stock changed while order was suspended — "${item.variationLabel || "an item"}" for ${product.name} is no longer available.`,
@@ -1523,7 +1679,9 @@ export const resumePOSOrder = async (
         const available = dedicated
           ? (variation.stockQuantity as number)
           : product.stockQuantity;
-        const required = dedicated ? item.quantity : variation.quantity * item.quantity;
+        const required = dedicated
+          ? item.quantity
+          : variation.quantity * item.quantity;
         if (available < required) {
           throw new AppError(
             `Stock changed while order was suspended — ${product.name} (${variation.label}) now only has ${available} available.`,
@@ -1709,7 +1867,10 @@ export const resolveScaleBarcode = async (
     const code = req.params.code as string;
 
     if (!SCALE_BARCODE_PATTERN.test(code)) {
-      throw new AppError("Not a scale-printed barcode (expected 18 digits)", 400);
+      throw new AppError(
+        "Not a scale-printed barcode (expected 18 digits)",
+        400,
+      );
     }
 
     const wareCode = code.slice(0, 7);

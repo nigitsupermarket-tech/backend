@@ -275,7 +275,11 @@ export const getDashboardStats = async (
         },
       }),
       prisma.productVariation.count({
-        where: { stockQuantity: 0, isActive: true, product: { status: "ACTIVE" } },
+        where: {
+          stockQuantity: 0,
+          isActive: true,
+          product: { status: "ACTIVE" },
+        },
       }),
       prisma.order.count({ where: { status: "PENDING" } }),
       prisma.pOSOrder.count({
@@ -742,6 +746,8 @@ export const getInventoryReport = async (
           stockQuantity: true,
           lowStockThreshold: true,
           images: true,
+          isScalable: true,
+          scaleUnit: true,
         },
         orderBy: { stockQuantity: "asc" },
       }),
@@ -754,6 +760,8 @@ export const getInventoryReport = async (
           stockQuantity: true,
           lowStockThreshold: true,
           images: true,
+          isScalable: true,
+          scaleUnit: true,
         },
         orderBy: { name: "asc" },
       }),
@@ -778,7 +786,9 @@ export const getInventoryReport = async (
           label: true,
           stockQuantity: true,
           productId: true,
-          product: { select: { id: true, name: true, sku: true, images: true } },
+          product: {
+            select: { id: true, name: true, sku: true, images: true },
+          },
         },
         orderBy: { stockQuantity: "asc" },
       }),
@@ -793,7 +803,9 @@ export const getInventoryReport = async (
           label: true,
           stockQuantity: true,
           productId: true,
-          product: { select: { id: true, name: true, sku: true, images: true } },
+          product: {
+            select: { id: true, name: true, sku: true, images: true },
+          },
         },
         orderBy: { label: "asc" },
       }),
@@ -808,6 +820,9 @@ export const getInventoryReport = async (
     // Reshape a preset row into the same flat shape the frontend already
     // renders for products, plus variation-identifying fields so the
     // Inventory page can route its "Adjust" action to the right target.
+    // unit is always "pack(s)" here — a dedicated variation's stockQuantity
+    // counts whole packs (e.g. "20 × 500g Pack"), never a raw scale
+    // amount, regardless of the parent product's own scaleUnit.
     const mapVariation = (v: any, status: string) => ({
       id: v.product.id,
       name: v.product.name,
@@ -818,17 +833,27 @@ export const getInventoryReport = async (
       stockStatus: status,
       variationId: v.id,
       variationLabel: v.label,
+      isScalable: true,
+      unit: "pack(s)",
     });
 
     res.status(200).json({
       success: true,
       data: {
         lowStock: [
-          ...lowStockData.map((p) => ({ ...p, stockStatus: calc(p) })),
+          ...lowStockData.map((p) => ({
+            ...p,
+            stockStatus: calc(p),
+            unit: p.isScalable ? p.scaleUnit || "unit" : null,
+          })),
           ...lowStockVariations.map((v) => mapVariation(v, "LOW_STOCK")),
         ],
         outOfStock: [
-          ...outOfStockData.map((p) => ({ ...p, stockStatus: calc(p) })),
+          ...outOfStockData.map((p) => ({
+            ...p,
+            stockStatus: calc(p),
+            unit: p.isScalable ? p.scaleUnit || "unit" : null,
+          })),
           ...outOfStockVariations.map((v) => mapVariation(v, "OUT_OF_STOCK")),
         ],
         totalStockUnits: totalValue._sum.stockQuantity || 0,
@@ -878,12 +903,10 @@ export const getCustomerStats = async (
         },
       }),
     ]);
-    res
-      .status(200)
-      .json({
-        success: true,
-        data: { bySegment, topCustomers, recentCustomers },
-      });
+    res.status(200).json({
+      success: true,
+      data: { bySegment, topCustomers, recentCustomers },
+    });
   } catch (error) {
     next(error);
   }
@@ -897,8 +920,16 @@ export const getOrdersByStatus = async (
 ) => {
   try {
     const [onlineBreakdown, posBreakdown] = await Promise.all([
-      prisma.order.groupBy({ by: ["status"], _count: true, _sum: { total: true } }),
-      prisma.pOSOrder.groupBy({ by: ["status"], _count: true, _sum: { total: true } }),
+      prisma.order.groupBy({
+        by: ["status"],
+        _count: true,
+        _sum: { total: true },
+      }),
+      prisma.pOSOrder.groupBy({
+        by: ["status"],
+        _count: true,
+        _sum: { total: true },
+      }),
     ]);
 
     // Prefixed so a pie/legend can tell "Online: SHIPPED" apart from

@@ -452,7 +452,13 @@ model Review {
 model InventoryLog {
   id              String   @id @default(auto()) @map("_id") @db.ObjectId
   productId       String   @db.ObjectId
-  type            String   // PURCHASE, SALE, ADJUSTMENT, RETURN, POS_SALE, EXPIRY, ONLINE_SALE, ONLINE_RETURN
+  type            String   // PURCHASE, SALE, ADJUSTMENT, RETURN, POS_SALE, EXPIRY, ONLINE_SALE, ONLINE_RETURN, TRANSFER, OVERSOLD
+  // TRANSFER — a variation's dedicated stock changed, moving the
+  //   equivalent amount into/out of the shared pool (see
+  //   applyProductVariations in product.controller.ts).
+  // OVERSOLD — a paid order/POS sale's stock deduction lost a race with
+  //   another sale on the same item; stock was floored at 0 instead of
+  //   going negative (see lib/stockSafety.ts).
   quantity        Float  // Float supports scalable product log entries
   previousQty     Float
   newQty          Float

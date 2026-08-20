@@ -117,22 +117,104 @@ export async function assertVariationBarcodesAvailable(
 export async function applyProductVariations(
   productId: string,
   incoming: VariationInput[],
+  performedBy?: { id?: string; name?: string },
 ) {
   await assertVariationBarcodesAvailable(incoming, productId);
 
+  const product = await prisma.product.findUnique({
+    where: { id: productId },
+    select: { stockQuantity: true },
+  });
+  if (!product) throw new NotFoundError("Product not found");
+
   const existingVariations = await prisma.productVariation.findMany({
     where: { productId },
-    select: { id: true },
+    select: { id: true, label: true, quantity: true, stockQuantity: true },
   });
+  const existingMap = new Map(existingVariations.map((v) => [v.id, v]));
   const existingIds = new Set(existingVariations.map((v) => v.id));
   const incomingIds = new Set(
     incoming.filter((v) => v.id).map((v) => v.id as string),
   );
   const idsToDelete = [...existingIds].filter((eid) => !incomingIds.has(eid));
 
-  await prisma.$transaction([
+  // ── Reconcile shared-pool <-> dedicated-stock transfers ──────────────────
+  // A variation's dedicated stockQuantity and the parent's shared
+  // stockQuantity both represent the SAME physical inventory, just counted
+  // two different ways. Without this, switching a variation to dedicated
+  // stock (or changing how many packs it holds) left the shared pool
+  // untouched — so the same stock silently got counted in both places.
+  // Whenever a variation's OWN dedicated count changes (newly set,
+  // cleared back to shared, adjusted, or the variation is deleted while
+  // still holding dedicated stock), the equivalent amount — dedicated
+  // packs × that variation's `quantity` — is pulled from or returned to
+  // the shared pool here, with one InventoryLog "TRANSFER" entry per
+  // variation so it's auditable exactly like a sale or manual adjustment.
+  // This intentionally does NOT apply to a brand-new product's initial
+  // variations (see createProduct) — at creation time an admin is
+  // expected to enter accurate starting numbers for each pool directly,
+  // there's no prior state to reconcile against.
+  type Transfer = { variationLabel: string; delta: number; reason: string };
+  const transfers: Transfer[] = [];
+
+  for (const v of incoming) {
+    const existing = v.id ? existingMap.get(v.id) : undefined;
+    const oldDedicated = existing?.stockQuantity ?? null;
+    const newDedicated =
+      v.stockQuantity !== undefined && v.stockQuantity !== null
+        ? Number(v.stockQuantity)
+        : null;
+    const qtyPerPack = Number(v.quantity) || existing?.quantity || 0;
+    if (oldDedicated === newDedicated || qtyPerPack <= 0) continue;
+
+    if (oldDedicated === null && newDedicated !== null) {
+      transfers.push({
+        variationLabel: v.label,
+        delta: -(newDedicated * qtyPerPack),
+        reason: `"${v.label}" switched to dedicated stock — ${newDedicated} pack(s) pulled from the shared pool`,
+      });
+    } else if (oldDedicated !== null && newDedicated === null) {
+      transfers.push({
+        variationLabel: v.label,
+        delta: oldDedicated * qtyPerPack,
+        reason: `"${v.label}" switched back to shared stock — ${oldDedicated} pack(s) returned to the shared pool`,
+      });
+    } else if (oldDedicated !== null && newDedicated !== null) {
+      const packDelta = newDedicated - oldDedicated;
+      transfers.push({
+        variationLabel: v.label,
+        delta: -(packDelta * qtyPerPack),
+        reason:
+          packDelta > 0
+            ? `"${v.label}" dedicated stock increased by ${packDelta} pack(s) — pulled from the shared pool`
+            : `"${v.label}" dedicated stock decreased by ${Math.abs(packDelta)} pack(s) — returned to the shared pool`,
+      });
+    }
+  }
+
+  // Deleted variations that still held dedicated stock return it to the pool
+  for (const id of idsToDelete) {
+    const existing = existingMap.get(id);
+    if (
+      existing &&
+      existing.stockQuantity !== null &&
+      existing.stockQuantity > 0
+    ) {
+      transfers.push({
+        variationLabel: existing.label,
+        delta: existing.stockQuantity * existing.quantity,
+        reason: `"${existing.label}" removed — ${existing.stockQuantity} pack(s) returned to the shared pool`,
+      });
+    }
+  }
+
+  const ops: any[] = [
     ...(idsToDelete.length
-      ? [prisma.productVariation.deleteMany({ where: { id: { in: idsToDelete } } })]
+      ? [
+          prisma.productVariation.deleteMany({
+            where: { id: { in: idsToDelete } },
+          }),
+        ]
       : []),
     ...incoming.map((v) => {
       const data = toVariationCreateInput(v);
@@ -141,7 +223,49 @@ export async function applyProductVariations(
       }
       return prisma.productVariation.create({ data: { ...data, productId } });
     }),
-  ]);
+  ];
+
+  if (transfers.length > 0) {
+    // Applied sequentially so each log's previousQty/newQty is accurate
+    // even when several variations change in the same save — never let
+    // the shared pool go negative; a transfer that would take it below 0
+    // is floored, and the log says so, so a mismatch is visible rather
+    // than silently absorbed.
+    let runningQty = product.stockQuantity;
+    for (const t of transfers) {
+      const rawNext = runningQty + t.delta;
+      const nextQty = Math.max(0, rawNext);
+      const wasClamped = rawNext < 0;
+      ops.push(
+        prisma.inventoryLog.create({
+          data: {
+            productId,
+            type: "TRANSFER",
+            quantity: t.delta,
+            previousQty: runningQty,
+            newQty: nextQty,
+            reason: wasClamped
+              ? `${t.reason} (shared pool floored at 0 — requested more than was available)`
+              : t.reason,
+            reference: "variation-stock-transfer",
+            variationLabel: t.variationLabel,
+            stockMode: "DEDICATED",
+            performedBy: performedBy?.id,
+            performedByName: performedBy?.name || "System",
+          },
+        }),
+      );
+      runningQty = nextQty;
+    }
+    ops.push(
+      prisma.product.update({
+        where: { id: productId },
+        data: { stockQuantity: runningQty },
+      }),
+    );
+  }
+
+  await prisma.$transaction(ops);
 }
 
 // GET /api/v1/products/shippable
@@ -525,7 +649,11 @@ export const createProduct = async (
       action: "create product",
       entity: "product",
       entityId: product.id,
-      metadata: { name: product.name, sku: product.sku, status: product.status },
+      metadata: {
+        name: product.name,
+        sku: product.sku,
+        status: product.status,
+      },
       req,
     });
 
@@ -551,8 +679,15 @@ export const updateProduct = async (
     const product = await prisma.product.findUnique({ where: { id } });
     if (!product) throw new NotFoundError("Product not found");
 
-    const { slug, sku, categoryId, brandId, variations, scaleWareCode, ...rest } =
-      req.body;
+    const {
+      slug,
+      sku,
+      categoryId,
+      brandId,
+      variations,
+      scaleWareCode,
+      ...rest
+    } = req.body;
 
     // Security: only admins can directly set stockQuantity via this endpoint.
     // Staff and Sales must go through the stock-approval workflow.
@@ -615,7 +750,16 @@ export const updateProduct = async (
       const incoming: VariationInput[] = Array.isArray(variations)
         ? variations
         : [];
-      await applyProductVariations(id, incoming);
+      const actor = req.user?.userId
+        ? await prisma.user.findUnique({
+            where: { id: req.user.userId },
+            select: { name: true },
+          })
+        : null;
+      await applyProductVariations(id, incoming, {
+        id: req.user?.userId,
+        name: actor?.name,
+      });
     }
 
     // Update product with all fields
@@ -637,7 +781,9 @@ export const updateProduct = async (
         ...(brandId !== undefined && {
           brand: brandId ? { connect: { id: brandId } } : { disconnect: true },
         }),
-        ...(normalizedWareCode !== undefined && { scaleWareCode: normalizedWareCode }),
+        ...(normalizedWareCode !== undefined && {
+          scaleWareCode: normalizedWareCode,
+        }),
       },
       include: { category: true, brand: true, variations: true },
     });
@@ -647,7 +793,11 @@ export const updateProduct = async (
       action: "update product",
       entity: "product",
       entityId: updated.id,
-      metadata: { name: updated.name, sku: updated.sku, changedFields: Object.keys(rest) },
+      metadata: {
+        name: updated.name,
+        sku: updated.sku,
+        changedFields: Object.keys(rest),
+      },
       req,
     });
 
@@ -782,8 +932,7 @@ export const updateInventory = async (
       const variation = await prisma.productVariation.findFirst({
         where: { id: variationId, productId: id },
       });
-      if (!variation)
-        throw new NotFoundError("Product variation not found");
+      if (!variation) throw new NotFoundError("Product variation not found");
       if (variation.stockQuantity === null) {
         throw new AppError(
           `"${variation.label}" uses shared stock — adjust the base product's stock instead, or switch it to dedicated stock first`,
