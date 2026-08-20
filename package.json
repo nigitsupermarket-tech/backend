@@ -17,6 +17,7 @@
     "prisma:seed": "ts-node prisma/seed.ts",
     "backfill:order-stock": "ts-node scripts/backfill-order-stock.ts",
     "backfill:scalable-flag": "ts-node scripts/backfill-scalable-flag.ts",
+    "backfill:scale-import-precision": "ts-node scripts/backfill-scale-import-precision.ts",
     "fix-cart-indexes": "ts-node scripts/fix-cart-indexes.ts"
   },
   "keywords": [

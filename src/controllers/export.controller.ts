@@ -1360,7 +1360,17 @@ export const exportCataloguePDF = async (
 //   scaleUnit      the modal's "unit" field (defaults to "kg")
 //   pricePerUnit   = the sheet's own Price column — that column IS the
 //                  per-unit price on a scale sheet, not a flat item price
-//   scaleStep      the modal's "scale step" field (defaults to 0.1)
+//   scaleStep      the modal's "scale step" field (defaults to 0.001)
+//   minOrderQty    the modal's "min order" field, if set — else left null,
+//                  which the storefront/POS already fall back to
+//                  scaleStep for
+//   maxOrderQty    the modal's "max order" field, if set — else left null
+//                  (uncapped; actual stock is still the real ceiling)
+//   scalePresets   the modal's "default presets" field, if set — a
+//                  comma-separated quick-select list applied identically
+//                  to every row this import creates (there's no per-row
+//                  source for this in a CECON sheet). Left empty by
+//                  default, matching prior behavior.
 //
 // A row whose Code already belongs to an existing product (matched by
 // scaleWareCode) is SKIPPED, never overwritten — this is the whole point:
@@ -1492,10 +1502,46 @@ export const importScaleGoodsSheet = async (
     // "sold by measurement/scale" and retype the price that was already on
     // the sheet.
     const scaleUnit = ((req.body.scaleUnit as string) || "kg").trim() || "kg";
-    const scaleStep = req.body.scaleStep ? parseFloat(req.body.scaleStep) : 0.1;
+    // Default lowered from 0.1 to 0.001 — the CECON scale itself can weigh
+    // down to the gram, and 0.1 was silently coarser than what the scale
+    // actually supports for most goods on this sheet (dry goods, cured
+    // meats, cheese — sold in fractions of a kg well below 0.1 at times).
+    // Still overridable per-import via the modal.
+    const scaleStep = req.body.scaleStep
+      ? parseFloat(req.body.scaleStep)
+      : 0.001;
     if (isNaN(scaleStep) || scaleStep < 0) {
       throw new AppError("scaleStep must be a positive number", 400);
     }
+
+    // Optional — every other scalable field a product can have that the
+    // sheet itself has no column for (there's no per-row source for these
+    // in a CECON PLU export). Set once per import run, applied to every
+    // new row, same as scaleUnit/scaleStep above. Left blank, a product
+    // behaves exactly as before: minOrderQty falls back to scaleStep,
+    // maxOrderQty is uncapped (stock is still the real ceiling), and
+    // scalePresets stays empty (no quick-select buttons) — none of these
+    // are required for a scalable product to work correctly, but leaving
+    // scalePresets unset means every scale-imported product launches with
+    // zero quick-select shortcuts until someone configures them by hand.
+    const minOrderQty = req.body.minOrderQty
+      ? parseFloat(req.body.minOrderQty)
+      : null;
+    if (minOrderQty !== null && (isNaN(minOrderQty) || minOrderQty < 0)) {
+      throw new AppError("minOrderQty must be a non-negative number", 400);
+    }
+    const maxOrderQty = req.body.maxOrderQty
+      ? parseFloat(req.body.maxOrderQty)
+      : null;
+    if (maxOrderQty !== null && (isNaN(maxOrderQty) || maxOrderQty <= 0)) {
+      throw new AppError("maxOrderQty must be a positive number", 400);
+    }
+    const scalePresets: number[] = req.body.scalePresets
+      ? String(req.body.scalePresets)
+          .split(",")
+          .map((v: string) => parseFloat(v.trim()))
+          .filter((v: number) => !isNaN(v) && v > 0)
+      : [];
 
     // Needed for ImportBatch attribution below — this importer is no
     // longer admin-only, so the acting user's real name matters for the
@@ -1704,6 +1750,9 @@ export const importScaleGoodsSheet = async (
             scaleUnit,
             pricePerUnit: row.price,
             scaleStep,
+            ...(minOrderQty !== null ? { minOrderQty } : {}),
+            ...(maxOrderQty !== null ? { maxOrderQty } : {}),
+            ...(scalePresets.length > 0 ? { scalePresets } : {}),
           },
         });
         batchItems.push({
