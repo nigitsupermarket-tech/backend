@@ -371,13 +371,67 @@ function parseCsvBool(raw: string | undefined | null): boolean {
   return v === "true" || v === "1" || v === "yes";
 }
 
+// Reads the uploaded product-import file — CSV or Excel — into the same
+// shape either way: an array of plain objects keyed by column header,
+// every value a plain string, so nothing downstream (buildData,
+// pickPresentFields, parseCsvBool, etc.) needs to know or care which
+// format the person actually uploaded.
+//
+// Detected by file extension rather than mimetype — browsers and OSes are
+// inconsistent about what mimetype they report for .xlsx/.xls/.csv, but
+// the extension the file was saved with is reliable enough in practice
+// (multer's fileFilter in export.routes.ts already accepts both by
+// extension OR mimetype for the same reason).
+//
+// Excel values come through `raw: false` (formatted-as-displayed
+// strings) rather than native types — a price cell stays "22000", not
+// the JS number 22000 — so parseFloat/parseInt calls downstream behave
+// identically to a CSV cell, and a boolean-typed Excel cell still reaches
+// parseCsvBool as a familiar "TRUE"/"FALSE" string instead of a native
+// `true`/`false` your average `row.x === "true"` string check would
+// have silently failed on (parseCsvBool itself is tolerant of a native
+// boolean too, as a second line of defence).
+function parseImportFile(file: Express.Multer.File): any[] {
+  const name = file.originalname.toLowerCase();
+  const isExcel = name.endsWith(".xlsx") || name.endsWith(".xls");
+
+  if (isExcel) {
+    let workbook: XLSX.WorkBook;
+    try {
+      workbook = XLSX.read(file.buffer, { type: "buffer" });
+    } catch {
+      throw new AppError(
+        "Could not read this file as an Excel spreadsheet — is it corrupted, or actually a CSV saved with a .xlsx name?",
+        400,
+      );
+    }
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    if (!sheet) {
+      throw new AppError("This spreadsheet has no sheets to read", 400);
+    }
+    // defval: "" — a genuinely blank cell becomes "" rather than being
+    // omitted from the row object entirely, matching how csv-parse's
+    // `columns: true` mode handles a blank CSV cell under a header (so
+    // pickPresentFields' "was this column present in the row at all"
+    // check behaves the same regardless of which format was uploaded).
+    return XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false }) as any[];
+  }
+
+  const csvContent = file.buffer.toString("utf-8");
+  return parse(csvContent, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+  }) as any[];
+}
+
 export const importProductsCSV = async (
   req: AuthRequest,
   res: Response,
   next: NextFunction,
 ) => {
   try {
-    if (!req.file) throw new AppError("Please upload a CSV file", 400);
+    if (!req.file) throw new AppError("Please upload a CSV or Excel file", 400);
 
     const role = req.user?.role;
     const isAdmin = role === "ADMIN";
@@ -386,12 +440,7 @@ export const importProductsCSV = async (
     // creating products there too — see frontend product-form.tsx).
     const canCreate = isAdmin || role === "MANAGER" || role === "STAFF";
 
-    const csvContent = req.file.buffer.toString("utf-8");
-    const records = parse(csvContent, {
-      columns: true,
-      skip_empty_lines: true,
-      trim: true,
-    }) as any[];
+    const records = parseImportFile(req.file);
 
     const results = {
       success: 0,
@@ -1266,13 +1315,10 @@ export const exportCataloguePDF = async (
 // Recognizes the exact layout the CECON scale's own PLU export produces
 // (mscale: Merchandise → Export) — a header row containing "Name", "Code",
 // and "Price" columns (an optional leading "PLU NO" column is ignored) —
-// plus two OPTIONAL columns this app looks for on top of that:
-//   "Stock"     a per-item stock count, so it doesn't have to default to
-//               the same number for every row
-//   "Category"  a per-item category name (matched case-insensitively; a
-//               name that doesn't match any existing category falls back
-//               to the generic default below, same as a row with no
-//               Category cell at all)
+// plus an OPTIONAL "Category" column this app looks for on top of that
+// (matched case-insensitively; a name that doesn't match any existing
+// category falls back to the generic default below, same as a row with no
+// Category cell at all).
 //
 // Every matched row becomes a brand-new product identified by its scale
 // Code, with everything the sheet doesn't carry filled in automatically:
@@ -1293,8 +1339,21 @@ export const exportCataloguePDF = async (
 //                  whatever was picked in the modal, else the generic
 //                  default category (found or created — see
 //                  resolveGenericScaleCategory below)
-//   stockQuantity  the sheet's own "Stock" cell if present and valid,
-//                  else the modal's "default stock" field, else 10
+//   stockQuantity  ALWAYS 0 — deliberately not read from the sheet at
+//                  all. This importer is meant to be re-run against a
+//                  living master sheet that only ever grows (new PLUs
+//                  added over time) — a "Stock" column would tempt
+//                  re-uploading the whole sheet to bulk-update
+//                  quantities, but that's exactly what this importer must
+//                  never do to an EXISTING product (see the skip rule
+//                  below). So the concept doesn't exist here at all —
+//                  every newly-created row starts at 0 and status DRAFT,
+//                  and an admin sets real stock (and flips it live) once
+//                  it's actually counted/weighed in.
+//   status         ALWAYS "DRAFT" — see stockQuantity above. A draft
+//                  product doesn't show on the storefront or POS, so
+//                  there's no risk of it being "in stock" with a made-up
+//                  number before anyone's checked.
 //   isScalable     always true — every row is sold by weight/measure on
 //                  the physical CECON scale, so this is set immediately
 //                  rather than left for an admin to toggle on by hand
@@ -1304,17 +1363,13 @@ export const exportCataloguePDF = async (
 //   scaleStep      the modal's "scale step" field (defaults to 0.1)
 //
 // A row whose Code already belongs to an existing product (matched by
-// scaleWareCode) is SKIPPED, never overwritten — re-uploading the same or
-// an updated sheet is always safe and only fills in what's still missing.
-// Admin-only, same boundary as CSV-creating-new-products (see the isAdmin
-// check in importProductsCSV above) — bulk-creating live catalogue rows is
-// not something a non-admin sheet import is allowed to do.
-const CECON_SHEET_STATUSES = [
-  "ACTIVE",
-  "DRAFT",
-  "OUT_OF_STOCK",
-  "DISCONTINUED",
-];
+// scaleWareCode) is SKIPPED, never overwritten — this is the whole point:
+// re-uploading the same master sheet after adding new rows to the bottom
+// of it is always safe, touches ONLY the new rows, and never rewrites
+// stock (or anything else) on a product that's already live. Admin-only,
+// same boundary as CSV-creating-new-products (see the isAdmin check in
+// importProductsCSV above) — bulk-creating live catalogue rows is not
+// something a non-admin sheet import is allowed to do.
 const GENERIC_SCALE_CATEGORY_NAME = "Scalable Products";
 const GENERIC_SCALE_CATEGORY_SLUG = "scalable-products";
 
@@ -1411,19 +1466,12 @@ export const importScaleGoodsSheet = async (
       if (!brand) throw new AppError("Brand not found", 404);
     }
 
-    const defaultStock = req.body.defaultStock
-      ? parseInt(req.body.defaultStock, 10)
-      : 10;
-    if (isNaN(defaultStock) || defaultStock < 0) {
-      throw new AppError("defaultStock must be a non-negative number", 400);
-    }
-    const status = ((req.body.status as string) || "ACTIVE").toUpperCase();
-    if (!CECON_SHEET_STATUSES.includes(status)) {
-      throw new AppError(
-        `status must be one of ${CECON_SHEET_STATUSES.join(", ")}`,
-        400,
-      );
-    }
+    // No defaultStock, no status option — every new row is created at
+    // stockQuantity: 0 and status: DRAFT, unconditionally. See the
+    // "stockQuantity" / "status" entries in the comment block above this
+    // function for why: this importer is meant to be re-run against a
+    // sheet that only ever grows, and inventing a stock number for a row
+    // nobody's actually counted yet is exactly the wrong default.
 
     // Every item on a CECON scale is, definitionally, sold by weight — the
     // sheet's "Price" column is the price for ONE unit of scaleUnit (e.g.
@@ -1471,7 +1519,6 @@ export const importScaleGoodsSheet = async (
     const nameIdx = headers.indexOf("name");
     const codeIdx = headers.indexOf("code");
     const priceIdx = headers.indexOf("price");
-    const stockIdx = headers.indexOf("stock"); // optional — this app's own addition
     const categoryIdx = headers.indexOf("category"); // optional — this app's own addition
     if (priceIdx === -1) {
       throw new AppError('Missing a "Price" column in this sheet.', 400);
@@ -1481,7 +1528,6 @@ export const importScaleGoodsSheet = async (
       name: string;
       code: string;
       price: number;
-      stock: number | null;
       categoryName: string | null;
       rowNum: number;
     };
@@ -1504,15 +1550,6 @@ export const importScaleGoodsSheet = async (
       }
       if (!name || !code || price === null) continue;
 
-      let stock: number | null = null;
-      if (stockIdx !== -1) {
-        const stockRaw = row[stockIdx];
-        if (stockRaw !== "" && stockRaw !== undefined && stockRaw !== null) {
-          const n = parseInt(String(stockRaw), 10);
-          if (!isNaN(n) && n >= 0) stock = n;
-        }
-      }
-
       let categoryName: string | null = null;
       if (categoryIdx !== -1) {
         const catRaw = row[categoryIdx];
@@ -1521,7 +1558,7 @@ export const importScaleGoodsSheet = async (
         }
       }
 
-      parsed.push({ name, code, price, stock, categoryName, rowNum: i + 1 });
+      parsed.push({ name, code, price, categoryName, rowNum: i + 1 });
     }
 
     const results = {
@@ -1632,10 +1669,13 @@ export const importScaleGoodsSheet = async (
             scaleWareCode: row.code,
             description: "No description available.",
             price: row.price,
-            stockQuantity: row.stock ?? defaultStock,
+            // Always 0, always DRAFT — see the big comment block above
+            // this function for why. Nothing here reads a Stock column
+            // or a "default stock" setting anymore.
+            stockQuantity: 0,
             lowStockThreshold: 10,
             images: [],
-            status: status as any,
+            status: "DRAFT",
             category: { connect: { id: resolvedCategoryId } },
             ...(brandId ? { brand: { connect: { id: brandId } } } : {}),
             // Scale/weight fields — see the comment above this function's

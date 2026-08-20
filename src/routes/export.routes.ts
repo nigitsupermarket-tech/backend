@@ -14,15 +14,27 @@ import { protect, staffOrAdmin } from "../middlewares/auth.middleware";
 
 const router = Router();
 
-// Multer configuration for CSV upload
+// Multer configuration for the product import upload. Originally CSV-only;
+// now also accepts Excel workbooks (.xlsx/.xls), since that's what most
+// people actually have open when they're editing a product sheet by hand
+// — importProductsCSV itself detects which one it got and parses
+// accordingly (see parseImportFile in export.controller.ts).
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB limit — supports large catalogues
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === "text/csv" || file.originalname.endsWith(".csv")) {
+    const name = file.originalname.toLowerCase();
+    const okExt =
+      name.endsWith(".csv") || name.endsWith(".xlsx") || name.endsWith(".xls");
+    const okMime = [
+      "text/csv",
+      "application/vnd.ms-excel", // .xls, and how some browsers mislabel .csv
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx
+    ].includes(file.mimetype);
+    if (okExt || okMime) {
       cb(null, true);
     } else {
-      cb(new Error("Only CSV files are allowed"));
+      cb(new Error("Only CSV or Excel (.xlsx/.xls) files are allowed"));
     }
   },
 });
