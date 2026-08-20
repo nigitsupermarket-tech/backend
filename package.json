@@ -5,6 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "nodemon src/server.ts",
+       "publish:scale-goods": "ts-node scripts/publish-scale-goods.ts",
     "postinstall": "prisma generate",
     "build": "prisma generate && tsc",
     "vercel-build": "prisma generate && tsc",

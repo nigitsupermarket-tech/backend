@@ -1214,6 +1214,64 @@ model StockApprovalRequest {
 }
 
 // ============================================
+// IMPORT BATCHES (undo support for CSV / scale-sheet product imports)
+// ============================================
+// One row per "Import" click (CSV import or CECON scale-sheet import).
+// Tracks exactly what that run did so it can be undone later — but ONLY
+// while nothing in the real world has depended on it yet (see the
+// `isBatchUndoable` check in export.controller.ts): no order/POS sale, no
+// cart/wishlist add, no review, no APPROVED stock-approval request tied to
+// it. The moment any of that happens, the batch is locked — undoing it
+// would mean deleting or rewriting something that already had an effect.
+model ImportBatch {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  type            String   // "CSV" | "SCALE_GOODS"
+  fileName        String?
+  performedBy     String   @db.ObjectId
+  performedByName String
+  performedByRole String
+  totalRows       Int      @default(0)
+  createdCount    Int      @default(0)
+  updatedCount    Int      @default(0)
+  failedCount     Int      @default(0)
+  stockRequestCount Int    @default(0) // # of StockApprovalRequests this batch created (non-admin path)
+  status          String   @default("COMPLETED") // COMPLETED | UNDONE
+  undoneAt        DateTime?
+  undoneBy        String?  @db.ObjectId
+  undoneByName    String?
+  createdAt       DateTime @default(now())
+
+  items           ImportBatchItem[]
+
+  @@map("import_batches")
+}
+
+model ImportBatchItem {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  batchId      String   @db.ObjectId
+  // Deliberately NOT a Prisma relation to Product — undoing a CREATED item
+  // deletes the product itself, so a hard FK here would either block that
+  // delete or force an awkward cascade the wrong direction.
+  productId    String   @db.ObjectId
+  productName  String
+  productSku   String
+  action       String   // "CREATED" | "UPDATED"
+  // Snapshot of ONLY the fields this row actually changed, captured BEFORE
+  // the write — enough to restore an UPDATED product on undo. Null for
+  // CREATED rows (undo = delete the product instead of reverting fields).
+  previousData Json?
+  // Set when this row's stock change was deferred to admin approval
+  // (non-admin import) rather than written immediately — lets undo cancel
+  // the still-pending request instead of leaving it orphaned.
+  stockApprovalRequestId String? @db.ObjectId
+  createdAt    DateTime @default(now())
+
+  batch        ImportBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@map("import_batch_items")
+}
+
+// ============================================
 // POS VOID-ORDER APPROVAL REQUESTS
 // ============================================
 // Only ADMIN can void a POS order directly. Every other role (STAFF,
