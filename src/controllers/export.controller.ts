@@ -1252,6 +1252,13 @@ export const exportCataloguePDF = async (
 //                  resolveGenericScaleCategory below)
 //   stockQuantity  the sheet's own "Stock" cell if present and valid,
 //                  else the modal's "default stock" field, else 10
+//   isScalable     always true — every row is sold by weight/measure on
+//                  the physical CECON scale, so this is set immediately
+//                  rather than left for an admin to toggle on by hand
+//   scaleUnit      the modal's "unit" field (defaults to "kg")
+//   pricePerUnit   = the sheet's own Price column — that column IS the
+//                  per-unit price on a scale sheet, not a flat item price
+//   scaleStep      the modal's "scale step" field (defaults to 0.1)
 //
 // A row whose Code already belongs to an existing product (matched by
 // scaleWareCode) is SKIPPED, never overwritten — re-uploading the same or
@@ -1364,12 +1371,28 @@ export const importScaleGoodsSheet = async (
     const defaultStock = req.body.defaultStock
       ? parseInt(req.body.defaultStock, 10)
       : 10;
+    if (isNaN(defaultStock) || defaultStock < 0) {
+      throw new AppError("defaultStock must be a non-negative number", 400);
+    }
     const status = ((req.body.status as string) || "ACTIVE").toUpperCase();
     if (!CECON_SHEET_STATUSES.includes(status)) {
       throw new AppError(
         `status must be one of ${CECON_SHEET_STATUSES.join(", ")}`,
         400,
       );
+    }
+
+    // Every item on a CECON scale is, definitionally, sold by weight — the
+    // sheet's "Price" column is the price for ONE unit of scaleUnit (e.g.
+    // one kg), not a flat per-item price. So every product this importer
+    // creates is marked scalable up front, with pricePerUnit set from that
+    // same Price column — no more opening each one afterwards just to tick
+    // "sold by measurement/scale" and retype the price that was already on
+    // the sheet.
+    const scaleUnit = ((req.body.scaleUnit as string) || "kg").trim() || "kg";
+    const scaleStep = req.body.scaleStep ? parseFloat(req.body.scaleStep) : 0.1;
+    if (isNaN(scaleStep) || scaleStep < 0) {
+      throw new AppError("scaleStep must be a positive number", 400);
     }
 
     let workbook: XLSX.WorkBook;
@@ -1572,6 +1595,13 @@ export const importScaleGoodsSheet = async (
             status: status as any,
             category: { connect: { id: resolvedCategoryId } },
             ...(brandId ? { brand: { connect: { id: brandId } } } : {}),
+            // Scale/weight fields — see the comment above this function's
+            // scaleUnit/scaleStep parsing for why these are set on every
+            // row rather than left for the admin to configure by hand.
+            isScalable: true,
+            scaleUnit,
+            pricePerUnit: row.price,
+            scaleStep,
           },
         });
         batchItems.push({
