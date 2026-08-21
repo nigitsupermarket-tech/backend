@@ -1747,9 +1747,31 @@ export const importScaleGoodsSheet = async (
             // scaleUnit/scaleStep parsing for why these are set on every
             // row rather than left for the admin to configure by hand.
             isScalable: true,
+            // Explicit rather than relying on the schema default — a
+            // scale-tracked physical item must always track inventory, or
+            // POS sales for it silently stop deducting stock (the
+            // deduction transaction skips any product with trackInventory
+            // false entirely) while still completing and printing a
+            // normal receipt, which is a genuinely hard bug to notice
+            // until someone does a physical stock count.
+            trackInventory: true,
             scaleUnit,
             pricePerUnit: row.price,
             scaleStep,
+            // Product.weight (shipping weight, kg) is a REQUIRED field on
+            // the "Add Product" form for exactly the reason left this
+            // gap: it's used to calculate table-rate shipping on online
+            // orders, and the form hard-blocks saving without it unless
+            // isScalable + a kg/g/lb scaleUnit lets it auto-fill to 1 (see
+            // product-form.tsx's handleSave). This importer's products
+            // are always kg by default and never had a weight set at
+            // all, so every one of them hit that same block on its very
+            // first edit — set it explicitly here so that never happens.
+            // 1 = "1kg shipped per 1kg ordered", the sane default for any
+            // kg-sold item; if scaleUnit is g or lb the same 1:1 ratio
+            // still applies since the shipping calc multiplies by the
+            // ordered quantity in that same unit.
+            weight: 1,
             ...(minOrderQty !== null ? { minOrderQty } : {}),
             ...(maxOrderQty !== null ? { maxOrderQty } : {}),
             ...(scalePresets.length > 0 ? { scalePresets } : {}),

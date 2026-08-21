@@ -18,6 +18,8 @@
     "backfill:order-stock": "ts-node scripts/backfill-order-stock.ts",
     "backfill:scalable-flag": "ts-node scripts/backfill-scalable-flag.ts",
     "backfill:scale-import-precision": "ts-node scripts/backfill-scale-import-precision.ts",
+    "backfill:scale-track-inventory": "ts-node scripts/backfill-scale-track-inventory.ts",
+    "backfill:scale-shipping-weight": "ts-node scripts/backfill-scale-shipping-weight.ts",
     "fix-cart-indexes": "ts-node scripts/fix-cart-indexes.ts"
   },
   "keywords": [
