@@ -655,3 +655,93 @@ export async function sendAdminVoidRequestEmail(
     ),
   );
 }
+
+export async function sendAdminProductDeleteRequestEmail(
+  adminEmails: string[],
+  params: {
+    productName: string;
+    productSku: string;
+    requestedBy: string;
+    requestedByRole: string;
+    reason: string;
+    relatedRecords: {
+      reviews: number;
+      orderItems: number;
+      posOrderItems: number;
+      cartItems: number;
+      wishlistItems: number;
+      inventoryLogs: number;
+      stockApprovals: number;
+      variations: number;
+      hasOrderHistory: boolean;
+    };
+  },
+): Promise<void> {
+  if (!adminEmails || adminEmails.length === 0) return;
+
+  const adminDeleteUrl = `${process.env.ADMIN_URL || process.env.CLIENT_URL}/admin/products/delete-requests`;
+  const r = params.relatedRecords;
+  const relatedRows = [
+    ["Order line items", r.orderItems],
+    ["POS order line items", r.posOrderItems],
+    ["Reviews", r.reviews],
+    ["Cart items", r.cartItems],
+    ["Wishlist items", r.wishlistItems],
+    ["Inventory logs", r.inventoryLogs],
+    ["Pending/past stock approvals", r.stockApprovals],
+    ["Variations", r.variations],
+  ]
+    .filter(([, count]) => (count as number) > 0)
+    .map(
+      ([label, count]) =>
+        `<li>${label}: <strong>${count}</strong></li>`,
+    )
+    .join("");
+
+  const html = `
+    <!DOCTYPE html><html><head><meta charset="utf-8"><style>${baseStyles}
+      .void-box { background:#fef2f2; border:1px solid #fecaca; border-radius:8px; padding:20px; margin:20px 0; }
+      .badge { display:inline-block; font-weight:700; font-size:13px; padding:3px 10px; border-radius:99px; color:#d97706; }
+    </style></head>
+    <body><div class="wrapper"><div class="container">
+      <div class="header"><h1>⚠️ Product Delete Approval Needed</h1></div>
+      <div class="content">
+        <p>A staff member has requested to permanently (hard) delete a product. This requires an admin's approval before it takes effect.</p>
+        <div class="void-box">
+          <p style="margin:0 0 8px;"><strong>Product:</strong> ${params.productName} (${params.productSku})</p>
+          <p style="margin:0 0 8px;"><strong>Requested by:</strong> ${params.requestedBy} <span style="color:#6b7280;font-size:12px;">(${params.requestedByRole})</span></p>
+          <p style="margin:0 0 8px;"><strong>Reason:</strong> ${params.reason}</p>
+          ${
+            relatedRows
+              ? `<p style="margin:12px 0 4px;"><strong>Related records that will be affected:</strong></p><ul style="margin:0 0 8px;padding-left:20px;">${relatedRows}</ul>`
+              : `<p style="margin:0 0 8px;color:#065f46;">No related records — safe to review.</p>`
+          }
+          ${
+            r.hasOrderHistory
+              ? `<p style="margin:0 0 8px;color:#b91c1c;"><strong>⚠️ This product has order history.</strong> Order/POS line items will keep their own record of the product name/SKU, but will no longer link to a live product.</p>`
+              : ""
+          }
+          <p style="margin:0;"><strong>Status:</strong> <span class="badge">PENDING APPROVAL</span></p>
+        </div>
+        <p style="text-align:center;margin:28px 0;">
+          <a href="${adminDeleteUrl}" class="button">Review Request</a>
+        </p>
+        <p class="note">This is an automated security notification. Do not reply to this email.</p>
+      </div>
+      <div class="footer"><p>© ${new Date().getFullYear()} Nigittriple Industry. All rights reserved.</p></div>
+    </div></div></body></html>
+  `;
+
+  const subject = `Product Delete Request: ${params.productName} by ${params.requestedBy} — Awaiting Approval`;
+
+  await Promise.allSettled(
+    adminEmails.map((adminEmail) =>
+      sendEmail({
+        to: adminEmail,
+        subject,
+        html,
+        text: `${params.requestedBy} (${params.requestedByRole}) requested to permanently delete product ${params.productName} (${params.productSku}). Reason: ${params.reason}. Status: PENDING APPROVAL.`,
+      }),
+    ),
+  );
+}

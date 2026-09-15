@@ -17,6 +17,7 @@ import {
   suspendPOSOrder,
   getSuspendedOrders,
   resumePOSOrder,
+  deleteSuspendedOrder,
   holdNewPOSOrder,
   resolveScaleBarcode,
 } from "../controllers/pos.controller";
@@ -44,6 +45,9 @@ router.post("/orders/:id/void-request", requestVoidOrder); // non-admin requests
 router.get("/orders/:id/void-request", getOrderVoidRequestStatus); // check pending/approved/rejected status
 router.put("/orders/:id/suspend", suspendPOSOrder); // suspend an already-OPEN order
 router.put("/orders/:id/resume", resumePOSOrder); // resume a SUSPENDED order
+// Delete/cancel a SUSPENDED (held) order — open to every POS role, no
+// approval needed (nothing was ever charged/deducted for a held order).
+router.delete("/orders/:id/suspended", deleteSuspendedOrder);
 
 // Void approval queue — ADMIN-only
 router.get("/void-requests", adminOnly, getVoidRequests);

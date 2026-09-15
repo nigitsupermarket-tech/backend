@@ -52,6 +52,7 @@ model User {
   reviews           Review[]
   wishlist          Wishlist?
   posOrders         POSOrder[]  // Staff/admin POS orders
+  draftStates       UserDraftState[]  // "continue where you left off" autosaves
 
   // Customer Segmentation
   customerSegment   String?   // VIP, Regular, New
@@ -1304,4 +1305,75 @@ model VoidApprovalRequest {
   posOrder        POSOrder  @relation(fields: [posOrderId], references: [id], onDelete: Cascade)
 
   @@map("void_approval_requests")
+}
+
+// ============================================
+// PRODUCT HARD-DELETE APPROVAL REQUESTS
+// ============================================
+// Only ADMIN can hard-delete a product directly. STAFF and MANAGER must
+// submit a request here for an admin to review and approve — mirrors
+// VoidApprovalRequest above. `relatedRecords` is a snapshot (captured at
+// request time, and re-captured at review time) of every record still
+// attached to the product, so whoever reviews the request — and anyone
+// with visibility into this queue — can see exactly what a hard delete
+// would take down with it before it happens.
+//
+// Deliberately NOT a Prisma relation to Product: approving the request
+// deletes the product itself, and a hard FK here would fight that delete
+// the same way ImportBatchItem avoids one for the same reason.
+model ProductDeleteApprovalRequest {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  productId       String    @db.ObjectId
+  productName     String
+  productSku      String
+  requestedBy     String    @db.ObjectId
+  requestedByName String
+  requestedByRole String
+  reason          String
+  // Snapshot of related-record counts at the time of the request (see
+  // getProductRelatedRecords in product.controller.ts for the shape):
+  // { reviews, orderItems, posOrderItems, cartItems, wishlistItems,
+  //   inventoryLogs, stockApprovals, variations }
+  relatedRecords  Json?
+  status          String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  reviewedBy      String?   @db.ObjectId
+  reviewedByName  String?
+  reviewedAt      DateTime?
+  reviewNote      String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("product_delete_approval_requests")
+}
+
+// ============================================
+// USER DRAFT STATE ("continue where you left off")
+// ============================================
+// Generic, per-user, per-context draft store. When a user is interrupted
+// mid-task (logged out, session expired, closed the tab) while filling a
+// form, building a POS cart, etc., the page autosaves its in-progress
+// state here under a stable `key` (e.g. "product-edit:<id>",
+// "product-create", "pos-cart:<sessionId>"). On next login, the frontend
+// checks for a "last-page" draft to route the user back to the exact page
+// they were on, and that page's own useDraftSync() hook restores its
+// `payload` into local state — so the user picks up exactly where they
+// stopped instead of starting over.
+//
+// One row per (userId, key) — a new save with the same key overwrites the
+// previous draft. Rows are deleted once their work is submitted/saved for
+// real, or explicitly discarded by the user.
+model UserDraftState {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  key       String   // e.g. "last-page", "product-edit:507f...", "pos-cart"
+  path      String?  // the route the draft belongs to, for redirect-on-login
+  payload   Json     // arbitrary draft state — form fields, cart lines, etc.
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+  @@index([userId])
+  @@map("user_draft_states")
 }

@@ -32,6 +32,7 @@ import wishlistRoutes from "./routes/wishlist.routes";
 import consultationRoutes from "./routes/consultation.routes";
 import quotationRoutes from "./routes/quotation.routes";
 import contactRoutes from "./routes/contact.routes";
+import draftRoutes from "./routes/draft.routes";
 
 // Import middleware
 import { errorHandler } from "./middlewares/errorHandler";
@@ -176,6 +177,7 @@ app.use(`${API_PREFIX}/wishlist`, wishlistRoutes);
 app.use(`${API_PREFIX}/consultations`, consultationRoutes);
 app.use(`${API_PREFIX}/quotations`, quotationRoutes);
 app.use(API_PREFIX, contactRoutes);
+app.use(`${API_PREFIX}/drafts`, draftRoutes);
 
 // ============================================
 // ERROR HANDLING

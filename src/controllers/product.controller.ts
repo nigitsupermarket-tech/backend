@@ -7,6 +7,7 @@ import {
   deleteCloudinaryImages,
   deleteCloudinaryImage,
 } from "../lib/cloudinary";
+import { sendAdminProductDeleteRequestEmail } from "../services/email.service";
 
 // ── Product variation helpers ──────────────────────────────────────────────
 // Shared by createProduct/updateProduct to turn raw request-body variation
@@ -811,37 +812,486 @@ export const updateProduct = async (
   }
 };
 
-// DELETE /api/v1/products/:id
-export const deleteProduct = async (
+// ── Related-records snapshot ──────────────────────────────────────────────
+// Every record type still attached to a product, counted up so whoever is
+// deciding whether to hard-delete it — the requester, the approving admin,
+// and anyone reading the request afterwards — can see the full blast
+// radius first. Order/POS order line items are NOT cascade-deleted (they
+// keep their own productName/productSku snapshot for historical order
+// display), so those counts are the most important ones to surface: they
+// won't be removed, they'll just point at a product that no longer exists.
+export async function getProductRelatedRecords(productId: string) {
+  const [
+    reviews,
+    orderItems,
+    posOrderItems,
+    cartItems,
+    wishlistItems,
+    inventoryLogs,
+    stockApprovals,
+    variations,
+  ] = await Promise.all([
+    prisma.review.count({ where: { productId } }),
+    prisma.orderItem.count({ where: { productId } }),
+    prisma.pOSOrderItem.count({ where: { productId } }),
+    prisma.cartItem.count({ where: { productId } }),
+    prisma.wishlistItem.count({ where: { productId } }),
+    prisma.inventoryLog.count({ where: { productId } }),
+    prisma.stockApprovalRequest.count({ where: { productId } }),
+    prisma.productVariation.count({ where: { productId } }),
+  ]);
+
+  return {
+    reviews,
+    orderItems,
+    posOrderItems,
+    cartItems,
+    wishlistItems,
+    inventoryLogs,
+    stockApprovals,
+    variations,
+    // Order/POS history is the one stakeholders actually need a warning
+    // about — those rows survive the delete but lose their live product
+    // link. Everything else (reviews, cart/wishlist lines, variations,
+    // logs, pending stock approvals) is cascade-deleted with the product.
+    hasOrderHistory: orderItems > 0 || posOrderItems > 0,
+  };
+}
+
+// GET /api/v1/products/:id/related-records
+// Any staff-side role with product access can preview what a hard delete
+// would take down before requesting or performing one.
+export const getProductRelatedRecordsSummary = async (
   req: AuthRequest,
   res: Response,
   next: NextFunction,
 ) => {
   try {
     const id = req.params.id as string;
-
-    const product = await prisma.product.findUnique({ where: { id } });
+    const product = await prisma.product.findUnique({
+      where: { id },
+      select: { id: true, name: true, sku: true },
+    });
     if (!product) throw new NotFoundError("Product not found");
 
-    // Delete all product images from Cloudinary before removing the DB record
-    if (product.images && product.images.length > 0) {
-      await deleteCloudinaryImages(product.images);
-    }
+    const relatedRecords = await getProductRelatedRecords(id);
 
-    await prisma.product.delete({ where: { id } });
+    res.status(200).json({ success: true, data: { product, relatedRecords } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── Shared hard-delete execution ─────────────────────────────────────────
+// Used by both the direct admin delete (deleteProduct) and by an admin
+// approving a pending delete request (approveProductDeleteRequest) — the
+// actual cascade-delete + image cleanup is identical either way, only
+// *who* is allowed to trigger it (and whether an approval hop is required
+// first) differs. Mirrors executeVoidOrder in pos.controller.ts.
+const executeProductDelete = async (id: string) => {
+  const product = await prisma.product.findUnique({ where: { id } });
+  if (!product) throw new NotFoundError("Product not found");
+
+  // Snapshot related records BEFORE deleting — this is what gets logged
+  // and, for the approval path, stored back onto the request record so
+  // the final counts (not just the counts at request time) are on file.
+  const relatedRecords = await getProductRelatedRecords(id);
+
+  // Delete all product images from Cloudinary before removing the DB record
+  if (product.images && product.images.length > 0) {
+    await deleteCloudinaryImages(product.images);
+  }
+
+  await prisma.product.delete({ where: { id } });
+
+  return { product, relatedRecords };
+};
+
+// DELETE /api/v1/products/:id
+// ADMIN-ONLY (also enforced by the `adminOnly` route middleware — the check
+// here is defense-in-depth). STAFF and MANAGER must use requestProductDelete
+// below instead, and wait for an admin to approve it.
+export const deleteProduct = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (req.user?.role !== "ADMIN") {
+      throw new AppError(
+        "Only an admin can delete a product directly. Please request approval from an admin instead.",
+        403,
+      );
+    }
+    const id = req.params.id as string;
+
+    const { product, relatedRecords } = await executeProductDelete(id);
 
     logActivity({
       userId: req.user?.userId,
       action: "delete product",
       entity: "product",
       entityId: id,
-      metadata: { name: product.name, sku: product.sku },
+      metadata: { name: product.name, sku: product.sku, relatedRecords },
       req,
     });
 
     res
       .status(200)
       .json({ success: true, message: "Product deleted successfully" });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ============================================
+// PRODUCT HARD-DELETE APPROVAL WORKFLOW
+// ============================================
+// Non-admin roles (STAFF, MANAGER) can't hard-delete a product directly —
+// they submit a request here that sits PENDING until an admin approves or
+// rejects it. Mirrors the POS void-request flow in pos.controller.ts.
+
+// POST /api/v1/products/:id/delete-request
+export const requestProductDelete = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (req.user?.role === "ADMIN") {
+      throw new AppError(
+        "Admins can delete this product directly — no approval request needed.",
+        400,
+      );
+    }
+
+    const id = req.params.id as string;
+    const { reason } = req.body;
+    if (!reason || !String(reason).trim()) {
+      throw new AppError(
+        "A reason is required to request a product deletion",
+        400,
+      );
+    }
+
+    const product = await prisma.product.findUnique({ where: { id } });
+    if (!product) throw new NotFoundError("Product not found");
+
+    const existingPending = await prisma.productDeleteApprovalRequest.findFirst(
+      { where: { productId: id, status: "PENDING" } },
+    );
+    if (existingPending) {
+      throw new AppError(
+        "A delete request for this product is already pending admin approval",
+        400,
+      );
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+    });
+    if (!user) throw new NotFoundError("User not found");
+
+    const relatedRecords = await getProductRelatedRecords(id);
+
+    const request = await prisma.productDeleteApprovalRequest.create({
+      data: {
+        productId: id,
+        productName: product.name,
+        productSku: product.sku,
+        requestedBy: req.user!.userId,
+        requestedByName: user.name,
+        requestedByRole: req.user!.role,
+        reason: String(reason).trim(),
+        relatedRecords,
+        status: "PENDING",
+      },
+    });
+
+    // Notify admin notification emails (fire-and-forget)
+    prisma.siteSetting
+      .findFirst()
+      .then((cfg) => {
+        const adminEmails: string[] =
+          (cfg as any)?.adminNotificationEmails ?? [];
+        if (adminEmails.length === 0) return;
+        sendAdminProductDeleteRequestEmail(adminEmails, {
+          productName: product.name,
+          productSku: product.sku,
+          requestedBy: user.name,
+          requestedByRole: req.user!.role,
+          reason: String(reason).trim(),
+          relatedRecords,
+        }).catch((err) =>
+          console.error(
+            "[email] Product delete request notification failed:",
+            err,
+          ),
+        );
+      })
+      .catch(() => {});
+
+    logActivity({
+      userId: req.user!.userId,
+      action: "request product delete",
+      entity: "product",
+      entityId: id,
+      metadata: {
+        name: product.name,
+        sku: product.sku,
+        reason,
+        relatedRecords,
+      },
+      req,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Delete request submitted — awaiting admin approval",
+      data: { request },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/v1/products/:id/delete-request
+// Returns the most recent delete request for this product (or null) so the
+// product edit/list UI can show a pending/approved/rejected banner instead
+// of the delete/request button.
+export const getProductDeleteRequestStatus = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const request = await prisma.productDeleteApprovalRequest.findFirst({
+      where: { productId: id },
+      orderBy: { createdAt: "desc" },
+    });
+    res.status(200).json({ success: true, data: { request: request || null } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/v1/products/delete-requests
+// Admin-only — the approval queue, mirrors getVoidRequests.
+export const getProductDeleteRequests = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { status, search, page = "1", limit = "20" } = req.query;
+
+    const where: any = {};
+    if (status) where.status = status;
+    if (search) {
+      where.OR = [
+        { productName: { contains: search as string, mode: "insensitive" } },
+        { productSku: { contains: search as string, mode: "insensitive" } },
+        {
+          requestedByName: { contains: search as string, mode: "insensitive" },
+        },
+      ];
+    }
+
+    const skip = (Number(page) - 1) * Number(limit);
+    const [requests, total] = await Promise.all([
+      prisma.productDeleteApprovalRequest.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip,
+        take: Number(limit),
+      }),
+      prisma.productDeleteApprovalRequest.count({ where }),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        requests,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          totalPages: Math.ceil(total / Number(limit)),
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/v1/products/delete-requests/pending-count
+export const getProductDeleteRequestsPendingCount = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const count = await prisma.productDeleteApprovalRequest.count({
+      where: { status: "PENDING" },
+    });
+    res.status(200).json({ success: true, data: { count } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/v1/products/delete-requests/:id
+// Admin-only — full detail view for the review page, including a FRESH
+// related-records count (the product may have accumulated more orders/
+// reviews/etc. since the request was first submitted).
+export const getProductDeleteRequest = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const request = await prisma.productDeleteApprovalRequest.findUnique({
+      where: { id },
+    });
+    if (!request) throw new NotFoundError("Delete request not found");
+
+    // The product may already be gone (request approved & product deleted
+    // earlier) — that's fine, we just fall back to the stored snapshot.
+    const currentRelatedRecords = await getProductRelatedRecords(
+      request.productId,
+    ).catch(() => null);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        request,
+        currentRelatedRecords: currentRelatedRecords ?? request.relatedRecords,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// PUT /api/v1/products/delete-requests/:id/approve
+// Admin-only — approves the request AND performs the actual hard delete in
+// one step.
+export const approveProductDeleteRequest = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const { reviewNote } = req.body;
+
+    const request = await prisma.productDeleteApprovalRequest.findUnique({
+      where: { id },
+    });
+    if (!request) throw new NotFoundError("Delete request not found");
+    if (request.status !== "PENDING") {
+      throw new AppError("Request is no longer pending", 400);
+    }
+
+    const admin = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+    });
+
+    // Perform the actual hard delete — will throw (and leave the request
+    // PENDING) if the product was already deleted by some other path.
+    const { relatedRecords } = await executeProductDelete(request.productId);
+
+    const updated = await prisma.productDeleteApprovalRequest.update({
+      where: { id },
+      data: {
+        status: "APPROVED",
+        reviewedBy: req.user!.userId,
+        reviewedByName: admin?.name,
+        reviewedAt: new Date(),
+        reviewNote,
+        relatedRecords, // refresh with the counts as of the actual delete
+      },
+    });
+
+    logActivity({
+      userId: req.user!.userId,
+      action: "approve product delete request",
+      entity: "product",
+      entityId: request.productId,
+      metadata: {
+        name: request.productName,
+        sku: request.productSku,
+        requestedByName: request.requestedByName,
+        reviewNote,
+        relatedRecords,
+      },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Delete request approved — product permanently deleted",
+      data: { request: updated },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// PUT /api/v1/products/delete-requests/:id/reject
+export const rejectProductDeleteRequest = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const { reviewNote } = req.body;
+
+    const request = await prisma.productDeleteApprovalRequest.findUnique({
+      where: { id },
+    });
+    if (!request) throw new NotFoundError("Delete request not found");
+    if (request.status !== "PENDING") {
+      throw new AppError("Request is no longer pending", 400);
+    }
+
+    const admin = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+    });
+
+    const updated = await prisma.productDeleteApprovalRequest.update({
+      where: { id },
+      data: {
+        status: "REJECTED",
+        reviewedBy: req.user!.userId,
+        reviewedByName: admin?.name,
+        reviewedAt: new Date(),
+        reviewNote,
+      },
+    });
+
+    logActivity({
+      userId: req.user!.userId,
+      action: "reject product delete request",
+      entity: "product",
+      entityId: request.productId,
+      metadata: {
+        name: request.productName,
+        sku: request.productSku,
+        reviewNote,
+      },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Delete request rejected",
+      data: { request: updated },
+    });
   } catch (error) {
     next(error);
   }

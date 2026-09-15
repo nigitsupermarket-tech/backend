@@ -1735,6 +1735,56 @@ export const resumePOSOrder = async (
   }
 };
 
+// ── DELETE /api/v1/pos/orders/:id/suspended ──────────────────────────────────
+// Deletes (or cancels) a SUSPENDED order. Open to every POS-permitted role
+// (ADMIN, STAFF, SALES, MANAGER) — unlike voiding a COMPLETED order, this
+// needs no approval gate: a suspended/held order never had stock deducted
+// or payment taken, so there's nothing to restore and no financial impact.
+// The order + its line items are hard-deleted outright (POSOrderItem
+// cascades on POSOrder, see schema.prisma) rather than soft-cancelled,
+// since a suspended cart was never a real sale to keep a record of.
+export const deleteSuspendedOrder = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (!req.user) throw new AppError("Authentication required", 401);
+    const id = req.params.id as string;
+
+    const order = await prisma.pOSOrder.findUnique({ where: { id } });
+    if (!order) throw new NotFoundError("POS order not found");
+    if (order.status !== "SUSPENDED") {
+      throw new AppError(
+        `Cannot delete an order with status "${order.status}". Only SUSPENDED (held) orders can be deleted/cancelled this way.`,
+        400,
+      );
+    }
+
+    await prisma.pOSOrder.delete({ where: { id } });
+
+    logActivity({
+      userId: req.user.userId,
+      action: "delete suspended POS order",
+      entity: "order",
+      entityId: id,
+      metadata: {
+        posOrderNumber: order.posOrderNumber,
+        suspendLabel: order.suspendLabel,
+        total: order.total,
+      },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Suspended order deleted.",
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // ── POST /api/v1/pos/orders/hold ─────────────────────────────────────────────
 // Creates an order directly in SUSPENDED status without touching stock.
 // Used by the frontend "Hold Transaction" button.
