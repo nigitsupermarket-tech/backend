@@ -678,6 +678,14 @@ export const getTopProducts = async (
 
     const tally = new Map<string, { quantity: number; revenue: number }>();
     for (const i of onlineItems) {
+      // A deleted product's line items have productId nulled out (see
+      // OrderItem.productId, onDelete: SetNull, in schema.prisma) — this
+      // widget looks the id back up against the live Product table below
+      // to show its name/image, so there's nothing useful to rank here
+      // for one that no longer exists. Skip rather than tally under a
+      // `null` key, which would also break the `{ id: { in: [...] } }`
+      // lookup further down.
+      if (!i.productId) continue;
       const prev = tally.get(i.productId) || { quantity: 0, revenue: 0 };
       tally.set(i.productId, {
         quantity: prev.quantity + (i._sum.quantity || 0),
@@ -685,6 +693,7 @@ export const getTopProducts = async (
       });
     }
     for (const i of posItems) {
+      if (!i.productId) continue;
       const prev = tally.get(i.productId) || { quantity: 0, revenue: 0 };
       tally.set(i.productId, {
         quantity: prev.quantity + (i._sum.quantity || 0),

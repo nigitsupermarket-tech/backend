@@ -656,7 +656,13 @@ const executeVoidOrder = async (
     : [];
   const products = orderItems.length
     ? await prisma.product.findMany({
-        where: { id: { in: orderItems.map((i) => i.productId) } },
+        where: {
+          id: {
+            in: orderItems
+              .map((i) => i.productId)
+              .filter((id): id is string => !!id),
+          },
+        },
       })
     : [];
   const productMap = new Map(products.map((p) => [p.id, p]));
@@ -691,8 +697,13 @@ const executeVoidOrder = async (
       if (restoreStock && orderItems.length > 0) {
         await Promise.all(
           orderItems.map((item) => {
-            const product = productMap.get(item.productId);
-            if (!product) return Promise.resolve();
+            const product = productMap.get(item.productId ?? "");
+            // Same narrowing reasoning as orderStock.ts: `product` only
+            // came from a real string key, so item.productId must be
+            // non-null here — but InventoryLog.productId is required, so
+            // TypeScript still needs this spelled out explicitly.
+            const productId = item.productId;
+            if (!product || !productId) return Promise.resolve();
 
             if (item.variationId) {
               const variation = variationMap.get(item.variationId);
@@ -708,7 +719,7 @@ const executeVoidOrder = async (
                   }),
                   tx.inventoryLog.create({
                     data: {
-                      productId: item.productId,
+                      productId,
                       type: "RETURN",
                       quantity: item.quantity,
                       previousQty: prevQty,
@@ -731,7 +742,7 @@ const executeVoidOrder = async (
                 : item.quantity;
               return Promise.all([
                 tx.product.update({
-                  where: { id: item.productId },
+                  where: { id: productId },
                   data: {
                     stockQuantity: { increment: baseQty },
                     salesCount: { decrement: item.quantity },
@@ -739,7 +750,7 @@ const executeVoidOrder = async (
                 }),
                 tx.inventoryLog.create({
                   data: {
-                    productId: item.productId,
+                    productId,
                     type: "RETURN",
                     quantity: baseQty,
                     previousQty: product.stockQuantity,
@@ -758,7 +769,7 @@ const executeVoidOrder = async (
             // Legacy fixed / free-form custom-weight line — unchanged.
             return Promise.all([
               tx.product.update({
-                where: { id: item.productId },
+                where: { id: productId },
                 data: {
                   stockQuantity: { increment: item.quantity },
                   salesCount: { decrement: item.quantity },
@@ -766,7 +777,7 @@ const executeVoidOrder = async (
               }),
               tx.inventoryLog.create({
                 data: {
-                  productId: item.productId,
+                  productId,
                   type: "RETURN",
                   quantity: item.quantity,
                   previousQty: product.stockQuantity,
@@ -1695,6 +1706,11 @@ export const resumePOSOrder = async (
 
     // Re-validate stock before resuming (items may have sold out while suspended)
     for (const item of order.items) {
+      // A held item's product could have been hard-deleted while it sat
+      // suspended (productId gets nulled by onDelete: SetNull) — nothing
+      // to re-validate stock against in that case, so skip it same as a
+      // product that was never found.
+      if (!item.productId) continue;
       const product = await prisma.product.findUnique({
         where: { id: item.productId },
         include: { variations: true },

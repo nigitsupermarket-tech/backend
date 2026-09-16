@@ -20,6 +20,8 @@
     "backfill:scale-import-precision": "ts-node scripts/backfill-scale-import-precision.ts",
     "backfill:scale-track-inventory": "ts-node scripts/backfill-scale-track-inventory.ts",
     "backfill:scale-shipping-weight": "ts-node scripts/backfill-scale-shipping-weight.ts",
+    "backfill:pending-delete-flag": "ts-node scripts/backfill-pending-delete-flag.ts",
+    "backfill:freeze-pending-deletes": "ts-node scripts/backfill-freeze-existing-pending-deletes.ts",
     "fix-cart-indexes": "ts-node scripts/fix-cart-indexes.ts"
   },
   "keywords": [

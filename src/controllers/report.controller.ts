@@ -205,10 +205,17 @@ export const generateReport = async (
           );
           break;
         case "product-sales-detail": {
-          const productId = (req.query.productId as string) || "";
-          if (!productId) {
+          // Keyed by SKU, not productId — productId gets nulled out on
+          // the line items once a product is hard-deleted (see
+          // OrderItem.productId / POSOrderItem.productId, onDelete:
+          // SetNull, in schema.prisma), but the sku snapshot on each
+          // line survives untouched and is globally unique, so it's the
+          // only identifier that reliably still finds a deleted
+          // product's sale history.
+          const sku = (req.query.sku as string) || "";
+          if (!sku) {
             throw new AppError(
-              "productId is required for type=product-sales-detail",
+              "sku is required for type=product-sales-detail",
               400,
             );
           }
@@ -217,7 +224,7 @@ export const generateReport = async (
             userId,
             page,
             limit,
-            productId,
+            sku,
           );
           break;
         }
@@ -608,14 +615,27 @@ async function buildProductSalesSection(
   const includeOnline = source !== "pos";
   const includePos = source !== "online";
 
-  // Merge both channels by productId — a product sold both online and
-  // in-store ends up as one row with a breakdown, not two.
+  // Merge both channels by productSku, NOT productId — once a product is
+  // hard-deleted, its onDelete: SetNull relation nulls out productId on
+  // every one of its historical line items (see OrderItem/POSOrderItem
+  // in schema.prisma; this had to change from a required relation to a
+  // nullable one specifically so the product COULD be deleted at all —
+  // deleting one used to fail outright once it had any sale history).
+  // Grouping by the now-nullable productId would collapse every deleted
+  // product's history into a single "null" bucket. sku is @unique on
+  // Product and untouched by that cascade, so it's the only identifier
+  // that keeps each deleted product's sales distinguishable from every
+  // other deleted product's.
   const merged = new Map<
     string,
     {
-      productId: string;
-      productName: string;
+      // Most recently seen productId for this sku — null once the
+      // product's been deleted (every one of its lines gets nulled at
+      // once). Kept around for potential future use (e.g. linking to a
+      // still-live product) but never used as the merge/lookup key.
+      productId: string | null;
       productSku: string;
+      productName: string;
       // Weighed/scalable products (deli meats, produce, anything sold by
       // kg/g/L/cup rather than by the piece) carry the unit their
       // quantity is measured in — captured on the line item at sale
@@ -632,11 +652,11 @@ async function buildProductSalesSection(
   >();
 
   for (const g of includeOnline ? onlineGroups : []) {
-    const key = g.productId;
+    const key = g.productSku;
     const row = merged.get(key) || {
       productId: g.productId,
-      productName: g.productName,
       productSku: g.productSku,
+      productName: g.productName,
       scaleUnit: g.scaleUnit ?? null,
       onlineQty: 0,
       onlineRevenue: 0,
@@ -648,20 +668,21 @@ async function buildProductSalesSection(
     row.onlineQty += g._sum.quantity || 0;
     row.onlineRevenue += g._sum.subtotal || 0;
     row.onlineLines += g._count._all;
-    // A later (more recent-looking) group with the same productId — from
-    // a renamed product — just overwrites the display name; doesn't
-    // affect the sums, which are keyed by productId regardless.
+    // A later (more recent-looking) group with the same sku — from a
+    // renamed product, or a still-live productId overwriting a
+    // previously-null one — just overwrites the display fields; doesn't
+    // affect the sums, which are keyed by sku regardless.
     row.productName = g.productName;
-    row.productSku = g.productSku;
+    if (g.productId) row.productId = g.productId;
     if (g.scaleUnit) row.scaleUnit = g.scaleUnit;
     merged.set(key, row);
   }
   for (const g of includePos ? posGroups : []) {
-    const key = g.productId;
+    const key = g.productSku;
     const row = merged.get(key) || {
       productId: g.productId,
-      productName: g.productName,
       productSku: g.productSku,
+      productName: g.productName,
       scaleUnit: g.scaleUnit ?? null,
       onlineQty: 0,
       onlineRevenue: 0,
@@ -674,40 +695,47 @@ async function buildProductSalesSection(
     row.posRevenue += g._sum.subtotal || 0;
     row.posLines += g._count._all;
     row.productName = g.productName;
-    row.productSku = g.productSku;
+    if (g.productId) row.productId = g.productId;
     if (g.scaleUnit) row.scaleUnit = g.scaleUnit;
     merged.set(key, row);
   }
 
   // Which of these products still exist — a single batched check, not a
-  // per-row lookup. Also doubles as the scaleUnit fallback below: older
-  // sale lines (written before scaleUnit was captured per-item, or from
-  // a free-weight entry path that never set it) can have a null
-  // scaleUnit on the line itself even for a genuinely scalable product,
-  // so the product's own current setting fills the gap when the line
-  // doesn't have one — the line's own value still wins when present,
-  // since that's the unit that was actually true at sale time.
-  const allIds = [...merged.keys()];
-  const existing = allIds.length
+  // per-row lookup, looked up by sku (the stable key) rather than
+  // productId (which may be null for every row of a deleted product).
+  // Also doubles as the scaleUnit fallback below: older sale lines
+  // (written before scaleUnit was captured per-item, or from a
+  // free-weight entry path that never set it) can have a null scaleUnit
+  // on the line itself even for a genuinely scalable product, so the
+  // product's own current setting fills the gap when the line doesn't
+  // have one — the line's own value still wins when present, since
+  // that's the unit that was actually true at sale time.
+  const allSkus = [...merged.keys()];
+  const existing = allSkus.length
     ? await prisma.product.findMany({
-        where: { id: { in: allIds } },
-        select: { id: true, scaleUnit: true },
+        where: { sku: { in: allSkus } },
+        select: { id: true, sku: true, scaleUnit: true },
       })
     : [];
-  const existingIds = new Set(existing.map((p) => p.id));
-  const liveScaleUnitById = new Map(
-    existing.map((p) => [p.id, p.scaleUnit || null]),
-  );
+  const existingBySku = new Map(existing.map((p) => [p.sku, p]));
 
   const rows = [...merged.values()]
-    .map((r) => ({
-      ...r,
-      scaleUnit: r.scaleUnit || liveScaleUnitById.get(r.productId) || null,
-      totalQty: r.onlineQty + r.posQty,
-      totalRevenue: r.onlineRevenue + r.posRevenue,
-      totalLines: r.onlineLines + r.posLines,
-      productExists: existingIds.has(r.productId),
-    }))
+    .map((r) => {
+      const live = existingBySku.get(r.productSku);
+      return {
+        ...r,
+        // Prefer the live product's current id if it still exists — a
+        // sale line's own productId can be stale/null even for a
+        // product that's still around, if newer lines set it and older
+        // ones predate that.
+        productId: live?.id ?? r.productId,
+        scaleUnit: r.scaleUnit || live?.scaleUnit || null,
+        totalQty: r.onlineQty + r.posQty,
+        totalRevenue: r.onlineRevenue + r.posRevenue,
+        totalLines: r.onlineLines + r.posLines,
+        productExists: !!live,
+      };
+    })
     .sort((a, b) => b.totalQty - a.totalQty);
 
   const total = rows.length;
@@ -744,12 +772,12 @@ async function buildProductSalesDetailSection(
   userId: string | undefined,
   page: number,
   limit: number,
-  productId: string,
+  sku: string,
 ) {
   const [onlineItems, posItems, productMeta] = await Promise.all([
     prisma.orderItem.findMany({
       where: {
-        productId,
+        productSku: sku,
         order: { createdAt: dateWhere, ...(userId ? { userId } : {}) },
       },
       select: {
@@ -772,7 +800,7 @@ async function buildProductSalesDetailSection(
     }),
     prisma.pOSOrderItem.findMany({
       where: {
-        productId,
+        productSku: sku,
         posOrder: {
           createdAt: dateWhere,
           status: "COMPLETED",
@@ -798,10 +826,12 @@ async function buildProductSalesDetailSection(
       },
     }),
     // Best-effort — null if the product has since been hard-deleted; the
-    // detail view still works, it just can't show a live product name.
+    // detail view still works, it just can't show a live product id/name.
+    // Looked up by sku (@unique, and the param itself), not id — id is
+    // exactly what a deletion nulls out on every historical line.
     prisma.product.findUnique({
-      where: { id: productId },
-      select: { name: true, sku: true, scaleUnit: true },
+      where: { sku },
+      select: { id: true, name: true, sku: true, scaleUnit: true },
     }),
   ]);
 
@@ -852,7 +882,7 @@ async function buildProductSalesDetailSection(
   const paged = entries.slice(start, start + limit);
 
   return {
-    productId,
+    productId: productMeta?.id ?? null,
     productName,
     productSku,
     scaleUnit,

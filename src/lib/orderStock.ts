@@ -39,7 +39,7 @@ export async function deductStockForOrder(
   if (!order || order.stockDeducted) return; // already deducted, or order missing
 
   const products = await prisma.product.findMany({
-    where: { id: { in: order.items.map((i) => i.productId) } },
+    where: { id: { in: order.items.map((i) => i.productId).filter((id): id is string => !!id) } },
     select: {
       id: true,
       name: true,
@@ -71,8 +71,16 @@ export async function deductStockForOrder(
       // outer-scoped array would double up entries across attempts.
       const events: OversoldEvent[] = [];
       for (const item of order.items) {
-        const product = productMap.get(item.productId);
-        if (!product || !product.trackInventory) continue; // don't track untracked products
+        const product = productMap.get(item.productId ?? "");
+        // Narrow once, right after the lookup: `product` was only found
+        // via a real string key in productMap, so if it's truthy here,
+        // item.productId was necessarily a real string — but TypeScript
+        // can't infer that correlation on its own, and InventoryLog.
+        // productId is a required (non-nullable) field below, so this
+        // needs an explicit local narrowing rather than relying on
+        // `item.productId` directly for the rest of the loop body.
+        const productId = item.productId;
+        if (!product || !productId || !product.trackInventory) continue; // don't track untracked products
 
         if (item.variationId && item.stockMode === "DEDICATED") {
           const variation = variationMap.get(item.variationId);
@@ -96,7 +104,7 @@ export async function deductStockForOrder(
             const shortfall = item.quantity - Math.max(0, prevQty);
             await tx.inventoryLog.create({
               data: {
-                productId: item.productId,
+                productId,
                 type: "OVERSOLD",
                 quantity: -item.quantity,
                 previousQty: prevQty,
@@ -111,7 +119,7 @@ export async function deductStockForOrder(
               },
             });
             events.push({
-              productId: item.productId,
+              productId,
               productName: product.name,
               sku: product.sku,
               shortfall: Math.max(0, shortfall),
@@ -123,7 +131,7 @@ export async function deductStockForOrder(
           } else {
             await tx.inventoryLog.create({
               data: {
-                productId: item.productId,
+                productId,
                 type: "ONLINE_SALE",
                 quantity: -item.quantity,
                 previousQty: prevQty,
@@ -146,7 +154,7 @@ export async function deductStockForOrder(
         // order-creation time when stockMode is SHARED), for legacy items
         // it's the raw scale/unit quantity, both deduct the same way.
         const result = await tx.product.updateMany({
-          where: { id: item.productId, stockQuantity: { gte: item.quantity } },
+          where: { id: productId, stockQuantity: { gte: item.quantity } },
           data: {
             stockQuantity: { decrement: item.quantity },
             salesCount: { increment: item.quantity },
@@ -155,7 +163,7 @@ export async function deductStockForOrder(
 
         if (result.count === 0) {
           await tx.product.update({
-            where: { id: item.productId },
+            where: { id: productId },
             data: {
               stockQuantity: 0,
               salesCount: { increment: item.quantity },
@@ -164,7 +172,7 @@ export async function deductStockForOrder(
           const shortfall = item.quantity - Math.max(0, product.stockQuantity);
           await tx.inventoryLog.create({
             data: {
-              productId: item.productId,
+              productId,
               type: "OVERSOLD",
               quantity: -item.quantity,
               previousQty: product.stockQuantity,
@@ -179,7 +187,7 @@ export async function deductStockForOrder(
             },
           });
           events.push({
-            productId: item.productId,
+            productId,
             productName: product.name,
             sku: product.sku,
             shortfall: Math.max(0, shortfall),
@@ -191,7 +199,7 @@ export async function deductStockForOrder(
         } else {
           await tx.inventoryLog.create({
             data: {
-              productId: item.productId,
+              productId,
               // Distinct from POS's "POS_SALE" so the stock-movement report can
               // filter/group by sales channel unambiguously.
               type: "ONLINE_SALE",
@@ -241,7 +249,7 @@ export async function restoreStockForOrder(
   if (!order || !order.stockDeducted) return;
 
   const products = await prisma.product.findMany({
-    where: { id: { in: order.items.map((i) => i.productId) } },
+    where: { id: { in: order.items.map((i) => i.productId).filter((id): id is string => !!id) } },
     select: { id: true, trackInventory: true, stockQuantity: true },
   });
   const productMap = new Map(products.map((p) => [p.id, p]));
@@ -259,8 +267,9 @@ export async function restoreStockForOrder(
   await runWithRetry(() =>
     prisma.$transaction(async (tx) => {
       for (const item of order.items) {
-        const product = productMap.get(item.productId);
-        if (!product || !product.trackInventory) continue;
+        const product = productMap.get(item.productId ?? "");
+        const productId = item.productId;
+        if (!product || !productId || !product.trackInventory) continue;
 
         if (item.variationId && item.stockMode === "DEDICATED") {
           const variation = variationMap.get(item.variationId);
@@ -271,7 +280,7 @@ export async function restoreStockForOrder(
           });
           await tx.inventoryLog.create({
             data: {
-              productId: item.productId,
+              productId,
               type: "ONLINE_RETURN",
               quantity: item.quantity,
               previousQty: prevQty,
@@ -289,7 +298,7 @@ export async function restoreStockForOrder(
         }
 
         await tx.product.update({
-          where: { id: item.productId },
+          where: { id: productId },
           data: {
             stockQuantity: { increment: item.quantity },
             salesCount: { decrement: item.quantity },
@@ -297,7 +306,7 @@ export async function restoreStockForOrder(
         });
         await tx.inventoryLog.create({
           data: {
-            productId: item.productId,
+            productId,
             // Distinct from POS's "RETURN" so the stock-movement report can
             // filter/group by sales channel unambiguously.
             type: "ONLINE_RETURN",

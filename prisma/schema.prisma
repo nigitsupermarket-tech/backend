@@ -370,10 +370,14 @@ scalePresets    Float[]   @default([])   // LEGACY: bare quantity presets. Super
   // moot on approval since the product itself gets deleted then.
   // Existing products predate this field and simply won't have it set at
   // all in MongoDB (Prisma defaults aren't backfilled onto existing
-  // documents), so every read of this field uses `{ not: true }` rather
-  // than `{ equals: false }` — the former also matches "field absent",
-  // the latter would not.
-  pendingDeleteRequest Boolean    @default(false)
+  // documents) — see backfill-pending-delete-flag.ts, which must be run
+  // once after this migration. Declared nullable (not a plain required
+  // Boolean) specifically because of that: a required field that's
+  // entirely absent from an existing document is a known MongoDB+Prisma
+  // deserialization hazard that can silently drop that document from
+  // query results altogether — an optional field degrades safely to
+  // `null` (treated as "not frozen" everywhere this is read) instead.
+  pendingDeleteRequest Boolean?   @default(false)
 
   // Analytics
   viewCount         Int           @default(0)
@@ -696,7 +700,17 @@ model Order {
 model OrderItem {
   id           String  @id @default(auto()) @map("_id") @db.ObjectId
   orderId      String  @db.ObjectId
-  productId    String  @db.ObjectId
+  // Nullable + onDelete: SetNull (not a required relation) is
+  // deliberate: this is what actually lets a product be hard-deleted
+  // while its order history survives, which the Product Sales report
+  // (report.controller.ts) and the delete-approval workflow's
+  // related-records warning both depend on. A required relation with no
+  // onDelete blocks the delete outright ("Invalid prisma.product.delete()
+  // ... would violate the required relation") the moment ANY order ever
+  // referenced that product — this line item keeps its own
+  // productName/productSku snapshot regardless, so losing the live link
+  // costs nothing display-wise.
+  productId    String? @db.ObjectId
 
   productName  String
   productSku   String
@@ -718,7 +732,7 @@ model OrderItem {
   subtotal     Float
 
   order        Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  product      Product @relation(fields: [productId], references: [id])
+  product      Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
 
   @@map("order_items")
 }
@@ -818,7 +832,11 @@ model POSOrder {
 model POSOrderItem {
   id           String   @id @default(auto()) @map("_id") @db.ObjectId
   posOrderId   String   @db.ObjectId
-  productId    String   @db.ObjectId
+  // Nullable + onDelete: SetNull, same reasoning as OrderItem.productId
+  // above — required to let a product be hard-deleted at all once it has
+  // POS sale history, and is what makes the Product Sales report keep
+  // reporting correctly after that deletion.
+  productId    String?  @db.ObjectId
 
   productName  String
   productSku   String
@@ -853,7 +871,7 @@ model POSOrderItem {
   processedByName String?
 
   posOrder     POSOrder @relation(fields: [posOrderId], references: [id], onDelete: Cascade)
-  product      Product  @relation(fields: [productId], references: [id])
+  product      Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
 
   @@map("pos_order_items")
 }
