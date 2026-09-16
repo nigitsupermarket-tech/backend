@@ -577,7 +577,7 @@ async function buildProductSalesSection(
 
   const [onlineGroups, posGroups] = await Promise.all([
     prisma.orderItem.groupBy({
-      by: ["productId", "productName", "productSku"],
+      by: ["productId", "productName", "productSku", "scaleUnit"],
       where: {
         ...productFilter,
         order: {
@@ -589,7 +589,7 @@ async function buildProductSalesSection(
       _count: { _all: true },
     }),
     prisma.pOSOrderItem.groupBy({
-      by: ["productId", "productName", "productSku"],
+      by: ["productId", "productName", "productSku", "scaleUnit"],
       where: {
         ...productFilter,
         posOrder: {
@@ -616,6 +616,12 @@ async function buildProductSalesSection(
       productId: string;
       productName: string;
       productSku: string;
+      // Weighed/scalable products (deli meats, produce, anything sold by
+      // kg/g/L/cup rather than by the piece) carry the unit their
+      // quantity is measured in — captured on the line item at sale
+      // time, same as productName/productSku, so it survives a product
+      // deletion the same way. Null for ordinary by-the-piece products.
+      scaleUnit: string | null;
       onlineQty: number;
       onlineRevenue: number;
       onlineLines: number;
@@ -631,6 +637,7 @@ async function buildProductSalesSection(
       productId: g.productId,
       productName: g.productName,
       productSku: g.productSku,
+      scaleUnit: g.scaleUnit ?? null,
       onlineQty: 0,
       onlineRevenue: 0,
       onlineLines: 0,
@@ -646,6 +653,7 @@ async function buildProductSalesSection(
     // affect the sums, which are keyed by productId regardless.
     row.productName = g.productName;
     row.productSku = g.productSku;
+    if (g.scaleUnit) row.scaleUnit = g.scaleUnit;
     merged.set(key, row);
   }
   for (const g of includePos ? posGroups : []) {
@@ -654,6 +662,7 @@ async function buildProductSalesSection(
       productId: g.productId,
       productName: g.productName,
       productSku: g.productSku,
+      scaleUnit: g.scaleUnit ?? null,
       onlineQty: 0,
       onlineRevenue: 0,
       onlineLines: 0,
@@ -666,23 +675,34 @@ async function buildProductSalesSection(
     row.posLines += g._count._all;
     row.productName = g.productName;
     row.productSku = g.productSku;
+    if (g.scaleUnit) row.scaleUnit = g.scaleUnit;
     merged.set(key, row);
   }
 
   // Which of these products still exist — a single batched check, not a
-  // per-row lookup, and purely cosmetic (a "deleted" badge in the UI).
+  // per-row lookup. Also doubles as the scaleUnit fallback below: older
+  // sale lines (written before scaleUnit was captured per-item, or from
+  // a free-weight entry path that never set it) can have a null
+  // scaleUnit on the line itself even for a genuinely scalable product,
+  // so the product's own current setting fills the gap when the line
+  // doesn't have one — the line's own value still wins when present,
+  // since that's the unit that was actually true at sale time.
   const allIds = [...merged.keys()];
   const existing = allIds.length
     ? await prisma.product.findMany({
         where: { id: { in: allIds } },
-        select: { id: true },
+        select: { id: true, scaleUnit: true },
       })
     : [];
   const existingIds = new Set(existing.map((p) => p.id));
+  const liveScaleUnitById = new Map(
+    existing.map((p) => [p.id, p.scaleUnit || null]),
+  );
 
   const rows = [...merged.values()]
     .map((r) => ({
       ...r,
+      scaleUnit: r.scaleUnit || liveScaleUnitById.get(r.productId) || null,
       totalQty: r.onlineQty + r.posQty,
       totalRevenue: r.onlineRevenue + r.posRevenue,
       totalLines: r.onlineLines + r.posLines,
@@ -739,6 +759,7 @@ async function buildProductSalesDetailSection(
         subtotal: true,
         productName: true,
         productSku: true,
+        scaleUnit: true,
         order: {
           select: {
             orderNumber: true,
@@ -765,6 +786,7 @@ async function buildProductSalesDetailSection(
         subtotal: true,
         productName: true,
         productSku: true,
+        scaleUnit: true,
         processedByName: true,
         posOrder: {
           select: {
@@ -779,7 +801,7 @@ async function buildProductSalesDetailSection(
     // detail view still works, it just can't show a live product name.
     prisma.product.findUnique({
       where: { id: productId },
-      select: { name: true, sku: true },
+      select: { name: true, sku: true, scaleUnit: true },
     }),
   ]);
 
@@ -789,6 +811,7 @@ async function buildProductSalesDetailSection(
       date: i.order.createdAt,
       reference: i.order.orderNumber,
       quantity: i.quantity,
+      scaleUnit: i.scaleUnit || productMeta?.scaleUnit || null,
       unitPrice: i.price,
       subtotal: i.subtotal,
       soldByLabel: i.order.customerName
@@ -800,6 +823,7 @@ async function buildProductSalesDetailSection(
       date: i.posOrder.createdAt,
       reference: i.posOrder.posOrderNumber,
       quantity: i.quantity,
+      scaleUnit: i.scaleUnit || productMeta?.scaleUnit || null,
       unitPrice: i.unitPrice,
       subtotal: i.subtotal,
       soldByLabel: `Cashier: ${
@@ -815,6 +839,13 @@ async function buildProductSalesDetailSection(
   const productName =
     productMeta?.name || fallback?.productName || "Deleted product";
   const productSku = productMeta?.sku || fallback?.productSku || "—";
+  // The unit these quantities are measured in (kg, g, L, cup, custom,
+  // etc.) for weighed/scalable products — null for ordinary by-the-piece
+  // products. Prefers the most recent line's own snapshot (correct even
+  // after the product is hard-deleted, or if its unit changed since);
+  // falls back to the live product's current scaleUnit when older lines
+  // never had it recorded per-item.
+  const scaleUnit = entries[0]?.scaleUnit || productMeta?.scaleUnit || null;
 
   const total = entries.length;
   const start = (page - 1) * limit;
@@ -824,6 +855,7 @@ async function buildProductSalesDetailSection(
     productId,
     productName,
     productSku,
+    scaleUnit,
     productExists: !!productMeta,
     totalLines: total,
     totalQty: entries.reduce((s, e) => s + e.quantity, 0),

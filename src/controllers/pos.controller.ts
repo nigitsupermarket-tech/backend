@@ -176,7 +176,15 @@ export const createPOSOrder = async (
           productSku: item.productSku,
           barcode: item.barcode ?? null,
           netWeight: item.netWeight ?? null,
-          scaleUnit: item.scaleUnit ?? null,
+          // Trust the server-side product record first, not whatever the
+          // client happened to send — this is exactly the field that was
+          // showing up empty in the Product Sales report for scalable
+          // products sold through this free-weight path (see
+          // buildProductSalesSection/buildProductSalesDetailSection in
+          // report.controller.ts, which now also fall back to the live
+          // product's scaleUnit for older rows missing this, but new
+          // sales should just have it recorded correctly from the start).
+          scaleUnit: product.scaleUnit ?? item.scaleUnit ?? null,
           quantity: item.quantity,
           unitPrice: item.unitPrice,
           subtotal: item.subtotal,
