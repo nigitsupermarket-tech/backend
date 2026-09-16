@@ -94,14 +94,23 @@ export const createPOSOrder = async (
     // "Transaction already closed: A query cannot be executed on an
     // expired transaction." Running all lookups in parallel cuts this
     // phase from O(n × RTT) down to ~O(1 × RTT).
-    const products = await Promise.all(
-      items.map((item: any) =>
-        prisma.product.findUnique({
-          where: { id: item.productId },
-          include: { variations: true },
-        }),
+    const [products, staffUser] = await Promise.all([
+      Promise.all(
+        items.map((item: any) =>
+          prisma.product.findUnique({
+            where: { id: item.productId },
+            include: { variations: true },
+          }),
+        ),
       ),
-    );
+      // Snapshot the cashier's name onto every line item at sale time (see
+      // processedByName on POSOrderItem) — same reasoning as
+      // InventoryLog.performedByName: reports that need "who sold this"
+      // per product/line shouldn't have to join through POSOrder -> User
+      // (or lose that attribution if the user is ever removed later).
+      prisma.user.findUnique({ where: { id: staffId }, select: { name: true } }),
+    ]);
+    const staffName = staffUser?.name || null;
 
     const validatedItems: any[] = [];
     // What actually gets written to POSOrderItem. Built server-side (not the
@@ -145,6 +154,8 @@ export const createPOSOrder = async (
           unitPrice: resolved.unitPrice,
           subtotal: resolved.subtotal,
           discountApplied: item.discountApplied ?? 0,
+          processedById: staffId,
+          processedByName: staffName,
         });
       } else {
         // ── Legacy fixed / free-form custom-weight line (unchanged) ──────
@@ -170,6 +181,8 @@ export const createPOSOrder = async (
           unitPrice: item.unitPrice,
           subtotal: item.subtotal,
           discountApplied: item.discountApplied ?? 0,
+          processedById: staffId,
+          processedByName: staffName,
         });
       }
     }

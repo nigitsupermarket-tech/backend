@@ -194,9 +194,36 @@ export const generateReport = async (
             limit,
           );
           break;
+        case "product-sales":
+          sections.productSales = await buildProductSalesSection(
+            dateWhere,
+            userId,
+            page,
+            limit,
+            source,
+            product,
+          );
+          break;
+        case "product-sales-detail": {
+          const productId = (req.query.productId as string) || "";
+          if (!productId) {
+            throw new AppError(
+              "productId is required for type=product-sales-detail",
+              400,
+            );
+          }
+          sections.productSalesDetail = await buildProductSalesDetailSection(
+            dateWhere,
+            userId,
+            page,
+            limit,
+            productId,
+          );
+          break;
+        }
         default:
           throw new AppError(
-            `Unknown report type "${t}". Use: overview, stock, stock-approvals, sales, pos, activity`,
+            `Unknown report type "${t}". Use: overview, stock, stock-approvals, sales, pos, activity, product-sales, product-sales-detail`,
             400,
           );
       }
@@ -514,6 +541,293 @@ async function buildActivitySection(
     total,
     byAction,
     entries,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    },
+  };
+}
+
+// ── Product Sales (units sold per product) ─────────────────────────────────
+// Deliberately reads ONLY the denormalized productId/productName/productSku
+// snapshot fields already carried on OrderItem/POSOrderItem — never a live
+// join to Product — so this report keeps reporting a deleted product's
+// sales history correctly forever (see requestProductDelete/deleteProduct
+// in product.controller.ts: the product row goes away, these line items
+// don't). `productExists` is the only place this ever checks the live
+// Product collection, purely to flag it in the UI.
+async function buildProductSalesSection(
+  dateWhere: { gte: Date; lte: Date },
+  userId: string | undefined,
+  page: number,
+  limit: number,
+  source: "all" | "online" | "pos" = "all",
+  product?: string,
+) {
+  const productFilter = product
+    ? {
+        OR: [
+          { productName: { contains: product, mode: "insensitive" as const } },
+          { productSku: { contains: product, mode: "insensitive" as const } },
+        ],
+      }
+    : {};
+
+  const [onlineGroups, posGroups] = await Promise.all([
+    prisma.orderItem.groupBy({
+      by: ["productId", "productName", "productSku"],
+      where: {
+        ...productFilter,
+        order: {
+          createdAt: dateWhere,
+          ...(userId ? { userId } : {}),
+        },
+      },
+      _sum: { quantity: true, subtotal: true },
+      _count: { _all: true },
+    }),
+    prisma.pOSOrderItem.groupBy({
+      by: ["productId", "productName", "productSku"],
+      where: {
+        ...productFilter,
+        posOrder: {
+          createdAt: dateWhere,
+          status: "COMPLETED",
+          ...(userId ? { processedById: userId } : {}),
+        },
+      },
+      _sum: { quantity: true, subtotal: true },
+      _count: { _all: true },
+    }),
+  ]);
+  // Both queries always run (cheap either way) — `source` just decides
+  // which results get merged in below, so there's no branching on the
+  // query shape itself to keep straight.
+  const includeOnline = source !== "pos";
+  const includePos = source !== "online";
+
+  // Merge both channels by productId — a product sold both online and
+  // in-store ends up as one row with a breakdown, not two.
+  const merged = new Map<
+    string,
+    {
+      productId: string;
+      productName: string;
+      productSku: string;
+      onlineQty: number;
+      onlineRevenue: number;
+      onlineLines: number;
+      posQty: number;
+      posRevenue: number;
+      posLines: number;
+    }
+  >();
+
+  for (const g of includeOnline ? onlineGroups : []) {
+    const key = g.productId;
+    const row = merged.get(key) || {
+      productId: g.productId,
+      productName: g.productName,
+      productSku: g.productSku,
+      onlineQty: 0,
+      onlineRevenue: 0,
+      onlineLines: 0,
+      posQty: 0,
+      posRevenue: 0,
+      posLines: 0,
+    };
+    row.onlineQty += g._sum.quantity || 0;
+    row.onlineRevenue += g._sum.subtotal || 0;
+    row.onlineLines += g._count._all;
+    // A later (more recent-looking) group with the same productId — from
+    // a renamed product — just overwrites the display name; doesn't
+    // affect the sums, which are keyed by productId regardless.
+    row.productName = g.productName;
+    row.productSku = g.productSku;
+    merged.set(key, row);
+  }
+  for (const g of includePos ? posGroups : []) {
+    const key = g.productId;
+    const row = merged.get(key) || {
+      productId: g.productId,
+      productName: g.productName,
+      productSku: g.productSku,
+      onlineQty: 0,
+      onlineRevenue: 0,
+      onlineLines: 0,
+      posQty: 0,
+      posRevenue: 0,
+      posLines: 0,
+    };
+    row.posQty += g._sum.quantity || 0;
+    row.posRevenue += g._sum.subtotal || 0;
+    row.posLines += g._count._all;
+    row.productName = g.productName;
+    row.productSku = g.productSku;
+    merged.set(key, row);
+  }
+
+  // Which of these products still exist — a single batched check, not a
+  // per-row lookup, and purely cosmetic (a "deleted" badge in the UI).
+  const allIds = [...merged.keys()];
+  const existing = allIds.length
+    ? await prisma.product.findMany({
+        where: { id: { in: allIds } },
+        select: { id: true },
+      })
+    : [];
+  const existingIds = new Set(existing.map((p) => p.id));
+
+  const rows = [...merged.values()]
+    .map((r) => ({
+      ...r,
+      totalQty: r.onlineQty + r.posQty,
+      totalRevenue: r.onlineRevenue + r.posRevenue,
+      totalLines: r.onlineLines + r.posLines,
+      productExists: existingIds.has(r.productId),
+    }))
+    .sort((a, b) => b.totalQty - a.totalQty);
+
+  const total = rows.length;
+  const totalUnitsSold = rows.reduce((s, r) => s + r.totalQty, 0);
+  const totalRevenue = rows.reduce((s, r) => s + r.totalRevenue, 0);
+  const start = (page - 1) * limit;
+  const paged = rows.slice(start, start + limit);
+
+  return {
+    source,
+    product: product || null,
+    distinctProducts: total,
+    totalUnitsSold,
+    totalRevenue,
+    entries: paged,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    },
+  };
+}
+
+// ── Product Sales Detail (every line that sold a specific product) ─────────
+// The drill-down behind a row in buildProductSalesSection: every individual
+// sale of one product, with who was involved — the cashier for a POS line
+// (from the item's own processedByName snapshot, falling back to
+// POSOrder.processedBy for rows written before that field existed), or the
+// buyer for an online line (Order.customerName, itself already a snapshot
+// rather than a live User join — see Order.customerName in schema.prisma).
+async function buildProductSalesDetailSection(
+  dateWhere: { gte: Date; lte: Date },
+  userId: string | undefined,
+  page: number,
+  limit: number,
+  productId: string,
+) {
+  const [onlineItems, posItems, productMeta] = await Promise.all([
+    prisma.orderItem.findMany({
+      where: {
+        productId,
+        order: { createdAt: dateWhere, ...(userId ? { userId } : {}) },
+      },
+      select: {
+        id: true,
+        quantity: true,
+        price: true,
+        subtotal: true,
+        productName: true,
+        productSku: true,
+        order: {
+          select: {
+            orderNumber: true,
+            createdAt: true,
+            customerName: true,
+            customerEmail: true,
+          },
+        },
+      },
+    }),
+    prisma.pOSOrderItem.findMany({
+      where: {
+        productId,
+        posOrder: {
+          createdAt: dateWhere,
+          status: "COMPLETED",
+          ...(userId ? { processedById: userId } : {}),
+        },
+      },
+      select: {
+        id: true,
+        quantity: true,
+        unitPrice: true,
+        subtotal: true,
+        productName: true,
+        productSku: true,
+        processedByName: true,
+        posOrder: {
+          select: {
+            posOrderNumber: true,
+            createdAt: true,
+            processedBy: { select: { name: true } },
+          },
+        },
+      },
+    }),
+    // Best-effort — null if the product has since been hard-deleted; the
+    // detail view still works, it just can't show a live product name.
+    prisma.product.findUnique({
+      where: { id: productId },
+      select: { name: true, sku: true },
+    }),
+  ]);
+
+  const entries = [
+    ...onlineItems.map((i) => ({
+      channel: "online" as const,
+      date: i.order.createdAt,
+      reference: i.order.orderNumber,
+      quantity: i.quantity,
+      unitPrice: i.price,
+      subtotal: i.subtotal,
+      soldByLabel: i.order.customerName
+        ? `Customer: ${i.order.customerName}`
+        : "Customer",
+    })),
+    ...posItems.map((i) => ({
+      channel: "pos" as const,
+      date: i.posOrder.createdAt,
+      reference: i.posOrder.posOrderNumber,
+      quantity: i.quantity,
+      unitPrice: i.unitPrice,
+      subtotal: i.subtotal,
+      soldByLabel: `Cashier: ${
+        i.processedByName || i.posOrder.processedBy?.name || "Unknown"
+      }`,
+    })),
+  ].sort((a, b) => b.date.getTime() - a.date.getTime());
+
+  // Fall back to the most recent line's own snapshot name/sku if the
+  // product no longer exists — this is exactly the resilience the whole
+  // section exists for.
+  const fallback = onlineItems[0] || posItems[0];
+  const productName =
+    productMeta?.name || fallback?.productName || "Deleted product";
+  const productSku = productMeta?.sku || fallback?.productSku || "—";
+
+  const total = entries.length;
+  const start = (page - 1) * limit;
+  const paged = entries.slice(start, start + limit);
+
+  return {
+    productId,
+    productName,
+    productSku,
+    productExists: !!productMeta,
+    totalLines: total,
+    totalQty: entries.reduce((s, e) => s + e.quantity, 0),
+    entries: paged,
     pagination: {
       page,
       limit,

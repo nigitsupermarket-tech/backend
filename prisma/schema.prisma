@@ -828,6 +828,16 @@ model POSOrderItem {
   unitPrice    Float
   subtotal     Float
   discountApplied Float  @default(0)
+  // Attribution — snapshot of the cashier who rang up this specific line,
+  // captured at sale time (see createPOSOrder). Same reasoning as
+  // InventoryLog.performedBy/performedByName: the per-product "who sold
+  // this" report needs this at the line-item level without joining
+  // through POSOrder -> User, and it stays intact even if that user
+  // account is ever removed later. Nullable because older rows (written
+  // before this field existed) and hold-drafts don't have it — the
+  // report falls back to POSOrder.processedBy for those.
+  processedById   String? @db.ObjectId
+  processedByName String?
 
   posOrder     POSOrder @relation(fields: [posOrderId], references: [id], onDelete: Cascade)
   product      Product  @relation(fields: [productId], references: [id])
