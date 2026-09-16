@@ -462,3 +462,31 @@ export const getPendingCount = async (
     next(error);
   }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/stock-approvals/pending-product-ids
+// Distinct productIds with a currently-PENDING stock request — the admin
+// product list uses this to show a "Stock update pending approval" label
+// per row, which disappears the next time the list is fetched after the
+// request is approved/rejected (no live push; a manual refresh or
+// revisiting the page picks up the change).
+// ─────────────────────────────────────────────────────────────────────────────
+export const getPendingProductIds = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const pending = await prisma.stockApprovalRequest.findMany({
+      where: { status: "PENDING" },
+      select: { productId: true },
+      distinct: ["productId"],
+    });
+    res.status(200).json({
+      success: true,
+      data: { productIds: pending.map((p) => p.productId) },
+    });
+  } catch (error) {
+    next(error);
+  }
+};

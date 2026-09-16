@@ -112,6 +112,22 @@ export const createPOSOrder = async (
     ]);
     const staffName = staffUser?.name || null;
 
+    // Reject the whole sale if any item is a product currently frozen by
+    // a pending hard-delete request — it shouldn't be sellable through
+    // POS while that's outstanding (see requestProductDelete in
+    // product.controller.ts). This is the server-side backstop: the POS
+    // terminal's own product search/grid already excludes frozen
+    // products from its results, so this only fires on a stale cached
+    // grid, a barcode scan of something just frozen, or a direct API
+    // call — but it must still be enforced here, not just hidden in the UI.
+    const frozenItem = products.find((p) => p?.pendingDeleteRequest);
+    if (frozenItem) {
+      throw new AppError(
+        `"${frozenItem.name}" is pending a deletion request and can't be sold right now.`,
+        400,
+      );
+    }
+
     const validatedItems: any[] = [];
     // What actually gets written to POSOrderItem. Built server-side (not the
     // raw client `items`) so a selected variation's price/label/stock-mode

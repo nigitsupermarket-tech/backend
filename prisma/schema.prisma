@@ -361,6 +361,19 @@ scalePresets    Float[]   @default([])   // LEGACY: bare quantity presets. Super
   isNewArrival      Boolean       @default(false)
   isOnPromotion     Boolean       @default(false)  // For "Promotions of the Week"
   promotionEndsAt   DateTime?     // When promotion expires
+  // Set true while a STAFF/MANAGER hard-delete request is PENDING admin
+  // review (see requestProductDelete / rejectProductDeleteRequest in
+  // product.controller.ts). While true, the product is hidden from the
+  // storefront and excluded from POS sale (createPOSOrder rejects it) —
+  // it stays fully visible in the admin product list with a status
+  // label so staff can see why. Cleared back to false on rejection;
+  // moot on approval since the product itself gets deleted then.
+  // Existing products predate this field and simply won't have it set at
+  // all in MongoDB (Prisma defaults aren't backfilled onto existing
+  // documents), so every read of this field uses `{ not: true }` rather
+  // than `{ equals: false }` — the former also matches "field absent",
+  // the latter would not.
+  pendingDeleteRequest Boolean    @default(false)
 
   // Analytics
   viewCount         Int           @default(0)

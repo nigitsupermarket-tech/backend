@@ -26,6 +26,7 @@ import {
   staffOrAdmin,
   adminOnly,
   restrictTo,
+  optionalAuth,
 } from "../middlewares/auth.middleware";
 
 // Product hard-delete requests can only be INITIATED by STAFF or MANAGER,
@@ -35,7 +36,14 @@ const staffOrManagerOnly = restrictTo("STAFF", "MANAGER");
 
 const router = Router();
 
-router.get("/", getProducts);
+// optionalAuth decodes a token if one is present without requiring it —
+// these two stay public (storefront + POS both hit them unauthenticated
+// or authenticated), but getProducts/getProduct need to know WHETHER the
+// caller is staff so a `?includeFrozen=true` from the admin product list
+// can be honored while a public/POS request without it still gets the
+// storefront-safe view (frozen products excluded) — see
+// requestProductDelete/pendingDeleteRequest in product.controller.ts.
+router.get("/", optionalAuth, getProducts);
 router.get("/products", getShippableProducts);
 router.get("/featured", getFeaturedProducts);
 router.get("/new-arrivals", getNewArrivals);
@@ -74,7 +82,7 @@ router.put(
   rejectProductDeleteRequest,
 );
 
-router.get("/:id", getProduct);
+router.get("/:id", optionalAuth, getProduct);
 router.post("/", protect, staffOrAdmin, createProduct);
 router.put("/:id", protect, staffOrAdmin, updateProduct);
 router.put("/:id/inventory", protect, staffOrAdmin, updateInventory);

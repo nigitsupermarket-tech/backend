@@ -9,6 +9,12 @@ import {
 } from "../lib/cloudinary";
 import { sendAdminProductDeleteRequestEmail } from "../services/email.service";
 
+// Roles that get to see/manage a frozen (pending-delete) product when they
+// explicitly ask for it via ?includeFrozen=true — everyone else (public
+// shoppers, and the POS terminal's own product search, which never passes
+// this flag) gets the safe default with frozen products excluded.
+const STAFF_SIDE_ROLES = ["ADMIN", "STAFF", "SALES", "MANAGER", "ACCOUNTANT"];
+
 // ── Product variation helpers ──────────────────────────────────────────────
 // Shared by createProduct/updateProduct to turn raw request-body variation
 // objects into safe Prisma input, and to make sure a barcode always
@@ -293,6 +299,11 @@ export const getShippableProducts = async (
 
     const where: any = {
       status: "ACTIVE",
+      // Excluded from the storefront while a hard-delete request is
+      // pending admin review — see requestProductDelete. `{ not: true }`
+      // (not `{ equals: false }`) also matches products that predate
+      // this field entirely.
+      pendingDeleteRequest: { not: true },
 
       // Must have at least one image
       images: { isEmpty: false },
@@ -383,7 +394,7 @@ export const getShippableProducts = async (
 
 // GET /api/v1/products/:id
 export const getProduct = async (
-  req: Request,
+  req: AuthRequest,
   res: Response,
   next: NextFunction,
 ) => {
@@ -412,6 +423,18 @@ export const getProduct = async (
     });
 
     if (!product) throw new NotFoundError("Product not found");
+
+    // Frozen (pending hard-delete) products behave as "not found" for
+    // anyone who isn't a staff-side caller explicitly asking to see them
+    // — same rule as getProducts, and the same reason: a customer
+    // shouldn't be able to load a frozen product's page directly by URL
+    // just because it's not in the listing anymore.
+    const isStaffCaller =
+      !!req.user && STAFF_SIDE_ROLES.includes(req.user.role);
+    const includeFrozen = req.query.includeFrozen === "true";
+    if (product.pendingDeleteRequest && !(isStaffCaller && includeFrozen)) {
+      throw new NotFoundError("Product not found");
+    }
 
     // Increment view count
     await prisma.product.update({
@@ -994,19 +1017,29 @@ export const requestProductDelete = async (
 
     const relatedRecords = await getProductRelatedRecords(id);
 
-    const request = await prisma.productDeleteApprovalRequest.create({
-      data: {
-        productId: id,
-        productName: product.name,
-        productSku: product.sku,
-        requestedBy: req.user!.userId,
-        requestedByName: user.name,
-        requestedByRole: req.user!.role,
-        reason: String(reason).trim(),
-        relatedRecords,
-        status: "PENDING",
-      },
-    });
+    const [request] = await prisma.$transaction([
+      prisma.productDeleteApprovalRequest.create({
+        data: {
+          productId: id,
+          productName: product.name,
+          productSku: product.sku,
+          requestedBy: req.user!.userId,
+          requestedByName: user.name,
+          requestedByRole: req.user!.role,
+          reason: String(reason).trim(),
+          relatedRecords,
+          status: "PENDING",
+        },
+      }),
+      // Freeze the product the moment a request goes in, not just once an
+      // admin gets to it — this is what actually hides it from the
+      // storefront/POS while the request is pending (see getProducts,
+      // getProduct, createPOSOrder).
+      prisma.product.update({
+        where: { id },
+        data: { pendingDeleteRequest: true },
+      }),
+    ]);
 
     // Notify admin notification emails (fire-and-forget)
     prisma.siteSetting
@@ -1274,6 +1307,17 @@ export const rejectProductDeleteRequest = async (
       },
     });
 
+    // Unfreeze — the product goes back to normal storefront/POS
+    // visibility now that the request is no longer pending. Guarded in
+    // case the product was itself removed by some other path in the
+    // meantime (rare, but this rejection should still succeed either way).
+    await prisma.product
+      .update({
+        where: { id: request.productId },
+        data: { pendingDeleteRequest: false },
+      })
+      .catch(() => null);
+
     logActivity({
       userId: req.user!.userId,
       action: "reject product delete request",
@@ -1307,7 +1351,7 @@ export const getFeaturedProducts = async (
     const { limit = "8" } = req.query;
 
     const products = await prisma.product.findMany({
-      where: { isFeatured: true, status: "ACTIVE" },
+      where: { isFeatured: true, status: "ACTIVE", pendingDeleteRequest: { not: true } },
       take: Number(limit),
       include: {
         category: { select: { id: true, name: true, slug: true } },
@@ -1333,7 +1377,7 @@ export const getNewArrivals = async (
     const { limit = "8" } = req.query;
 
     const products = await prisma.product.findMany({
-      where: { isNewArrival: true, status: "ACTIVE" },
+      where: { isNewArrival: true, status: "ACTIVE", pendingDeleteRequest: { not: true } },
       take: Number(limit),
       include: {
         category: { select: { id: true, name: true, slug: true } },
@@ -1513,7 +1557,7 @@ async function resolveBrandId(value: string): Promise<string | null> {
 }
 
 export const getProducts = async (
-  req: Request,
+  req: AuthRequest,
   res: Response,
   next: NextFunction,
 ) => {
@@ -1536,6 +1580,7 @@ export const getProducts = async (
       status = "ACTIVE",
       sort = "newest",
       tags,
+      includeFrozen,
     } = req.query;
 
     const skip = (Number(page) - 1) * Number(limit);
@@ -1548,6 +1593,20 @@ export const getProducts = async (
       where.status = statusUpper; // e.g. "ACTIVE", "DRAFT", "OUT_OF_STOCK"
     }
     // "all" or missing → no status filter → admin sees every product
+
+    // ── Frozen (pending hard-delete) products ──────────────────────────
+    // Hidden from the storefront and from POS by default. Only a
+    // staff-side, authenticated caller that explicitly asks for them
+    // (the admin product list, so it can show the "pending deletion"
+    // label — see delete-requests workflow) gets them included; a public
+    // shopper or the POS terminal's product search never passes this
+    // flag, so they get the safe default regardless of what `status` is
+    // requested. `{ not: true }` (not `{ equals: false }`) also matches
+    // products that predate this field entirely — see schema.prisma.
+    const isStaffCaller = !!req.user && STAFF_SIDE_ROLES.includes(req.user.role);
+    if (!(includeFrozen === "true" && isStaffCaller)) {
+      where.pendingDeleteRequest = { not: true };
+    }
 
     if (search) {
       where.OR = [
@@ -1623,6 +1682,12 @@ export const getProducts = async (
             {
               $match: {
                 status: "ACTIVE",
+                // "random" sort is a storefront-only affordance (this
+                // path already hardcodes status: "ACTIVE" regardless of
+                // whatever the caller asked for) — always exclude
+                // pending-delete-frozen products here, same as every
+                // other public listing.
+                pendingDeleteRequest: { $ne: true },
                 ...(Object.keys(where).length > 1
                   ? { $expr: { $and: [] } }
                   : {}),
