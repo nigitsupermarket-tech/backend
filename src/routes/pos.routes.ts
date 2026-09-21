@@ -20,6 +20,7 @@ import {
   deleteSuspendedOrder,
   holdNewPOSOrder,
   resolveScaleBarcode,
+  getPOSCatalog,
 } from "../controllers/pos.controller";
 import { protect, staffOrAdmin, adminOnly } from "../middlewares/auth.middleware";
 
@@ -39,6 +40,9 @@ router.get("/orders/:id", getPOSOrder);
 // field layout). Static path, must stay above nothing here since it's
 // under a distinct prefix already.
 router.get("/scale-barcode/:code", resolveScaleBarcode);
+// Full/delta product snapshot for the terminal's offline IndexedDB cache —
+// see getPOSCatalog for why this is lean and how updatedSince works.
+router.get("/catalog", getPOSCatalog);
 // Voiding — ADMIN-only. Every other role must request approval instead.
 router.put("/orders/:id/void", adminOnly, voidPOSOrder);
 router.post("/orders/:id/void-request", requestVoidOrder); // non-admin requests approval

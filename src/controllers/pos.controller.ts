@@ -1942,6 +1942,102 @@ export const holdNewPOSOrder = async (
   }
 };
 
+// GET /api/v1/pos/catalog?updatedSince=<ISO date>
+//
+// Feeds the POS terminal's offline product cache (IndexedDB on the
+// frontend — see lib/pos-offline-cache.ts). Two modes:
+//
+//   • No `updatedSince`: full snapshot of every product the POS can sell
+//     (ACTIVE, not frozen for hard-delete). Called once on first load, or
+//     whenever the client's local cache is empty/corrupt.
+//   • `updatedSince` given: only rows touched since that timestamp —
+//     INCLUDING ones that moved OUT of ACTIVE (went OUT_OF_STOCK, DRAFT,
+//     archived, etc.), so the client can evict them from its cache
+//     instead of selling a discontinued product all day on stale data.
+//
+// Deliberately excludes description/images/nutritional-info/etc. — the
+// POS terminal only needs enough to resolve a scan/search and price a
+// line item instantly, and a lean payload is what makes syncing the
+// *whole* catalog on a slow connection viable at all.
+//
+// Returns `serverTime` so the client stores THAT (not its own clock) as
+// the next `updatedSince` cursor — avoids drift/skew between the
+// terminal's clock and the server's.
+export const getPOSCatalog = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { updatedSince } = req.query;
+    const serverTime = new Date();
+
+    const isDelta = typeof updatedSince === "string" && updatedSince.length > 0;
+    let since: Date | null = null;
+    if (isDelta) {
+      since = new Date(updatedSince as string);
+      if (isNaN(since.getTime())) {
+        throw new AppError("Invalid updatedSince timestamp", 400);
+      }
+    }
+
+    const where: any = isDelta
+      ? { updatedAt: { gt: since } }
+      : { status: "ACTIVE", pendingDeleteRequest: { not: true } };
+
+    const products = await prisma.product.findMany({
+      where,
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        barcode: true,
+        price: true,
+        comparePrice: true,
+        stockQuantity: true,
+        trackInventory: true,
+        allowBackorder: true,
+        lowStockThreshold: true,
+        status: true,
+        pendingDeleteRequest: true,
+        isScalable: true,
+        scaleUnit: true,
+        scaleStep: true,
+        scaleWareCode: true,
+        images: true, // scalar String[] — client keeps only images[0] as its thumbnail
+        updatedAt: true,
+        variations: {
+          select: {
+            id: true,
+            label: true,
+            quantity: true,
+            price: true,
+            compareAtPrice: true,
+            barcode: true,
+            stockQuantity: true,
+            isDefault: true,
+            isActive: true,
+            sortOrder: true,
+          },
+        },
+      },
+      orderBy: { updatedAt: "asc" },
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        products,
+        serverTime: serverTime.toISOString(),
+        mode: isDelta ? "delta" : "full",
+        count: products.length,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // GET /api/v1/pos/scale-barcode/:code
 //
 // Decodes a barcode printed by the CECON checkout scale itself (not a
