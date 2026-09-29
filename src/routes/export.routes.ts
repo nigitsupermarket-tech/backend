@@ -2,6 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import {
   exportProductsCSV,
+  exportProductsExcel,
   exportProductsPDF,
   importProductsCSV,
   downloadCSVTemplate,
@@ -60,6 +61,7 @@ const scaleSheetUpload = multer({
 
 // Admin routes (protected)
 router.get("/products/csv", protect, staffOrAdmin, exportProductsCSV);
+router.get("/products/excel", protect, staffOrAdmin, exportProductsExcel);
 router.get("/products/pdf", protect, staffOrAdmin, exportProductsPDF);
 router.post(
   "/products/import",

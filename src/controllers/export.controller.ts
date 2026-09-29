@@ -136,75 +136,82 @@ const PRODUCT_CSV_COLUMNS = [
 ] as const;
 
 // ── EXPORT PRODUCTS CSV ───────────────────────────────────────────────────────
+// ── EXPORT PRODUCTS CSV ───────────────────────────────────────────────────────
+// Shared row-shaping logic for CSV and Excel export — the same data at
+// the same column order, just written by a different library at the end.
+async function buildProductExportRows() {
+  const products = await prisma.product.findMany({
+    include: { category: true, brand: true, variations: true },
+    orderBy: { createdAt: "desc" },
+  });
+
+  return products.map((p) => ({
+    name: p.name,
+    slug: p.slug,
+    sku: p.sku,
+    barcode: p.barcode || "",
+    description: p.description,
+    shortDescription: p.shortDescription || "",
+    price: p.price,
+    comparePrice: p.comparePrice || "",
+    costPrice: p.costPrice || "",
+    stockQuantity: p.stockQuantity,
+    lowStockThreshold: p.lowStockThreshold,
+    categoryId: p.categoryId,
+    brandId: p.brandId || "",
+    status: p.status,
+    isFeatured: p.isFeatured,
+    isNewArrival: p.isNewArrival,
+    isOnPromotion: p.isOnPromotion,
+    tags: p.tags.join("|"),
+    images: p.images.join("|"),
+    netWeight: p.netWeight || "",
+    unitsPerCarton: p.unitsPerCarton || "",
+    origin: p.origin || "",
+    weight: p.weight || "",
+    isHalal: p.isHalal,
+    isOrganic: p.isOrganic,
+    isKosher: p.isKosher,
+    isVegan: p.isVegan,
+    isGlutenFree: p.isGlutenFree,
+    naifdaNumber: p.naifdaNumber || "",
+    storageInstructions: p.storageInstructions || "",
+    ingredients: p.ingredients || "",
+    allergens: (p.allergens || []).join("|"),
+    // ── Scalable / weighted product ──
+    isScalable: p.isScalable,
+    scaleUnit: p.scaleUnit || "",
+    pricePerUnit: p.pricePerUnit ?? "",
+    minOrderQty: p.minOrderQty ?? "",
+    maxOrderQty: p.maxOrderQty ?? "",
+    scaleStep: p.scaleStep ?? "",
+    scalePresets: (p.scalePresets || []).join("|"),
+    scaleWareCode: p.scaleWareCode || "",
+    variations: JSON.stringify(
+      (p.variations || []).map((v) => ({
+        id: v.id,
+        label: v.label,
+        quantity: v.quantity,
+        price: v.price,
+        compareAtPrice: v.compareAtPrice,
+        barcode: v.barcode,
+        sku: v.sku,
+        stockQuantity: v.stockQuantity,
+        isDefault: v.isDefault,
+        isActive: v.isActive,
+        sortOrder: v.sortOrder,
+      })),
+    ),
+  }));
+}
+
 export const exportProductsCSV = async (
   req: AuthRequest,
   res: Response,
   next: NextFunction,
 ) => {
   try {
-    const products = await prisma.product.findMany({
-      include: { category: true, brand: true, variations: true },
-      orderBy: { createdAt: "desc" },
-    });
-
-    const csvData = products.map((p) => ({
-      name: p.name,
-      slug: p.slug,
-      sku: p.sku,
-      barcode: p.barcode || "",
-      description: p.description,
-      shortDescription: p.shortDescription || "",
-      price: p.price,
-      comparePrice: p.comparePrice || "",
-      costPrice: p.costPrice || "",
-      stockQuantity: p.stockQuantity,
-      lowStockThreshold: p.lowStockThreshold,
-      categoryId: p.categoryId,
-      brandId: p.brandId || "",
-      status: p.status,
-      isFeatured: p.isFeatured,
-      isNewArrival: p.isNewArrival,
-      isOnPromotion: p.isOnPromotion,
-      tags: p.tags.join("|"),
-      images: p.images.join("|"),
-      netWeight: p.netWeight || "",
-      unitsPerCarton: p.unitsPerCarton || "",
-      origin: p.origin || "",
-      weight: p.weight || "",
-      isHalal: p.isHalal,
-      isOrganic: p.isOrganic,
-      isKosher: p.isKosher,
-      isVegan: p.isVegan,
-      isGlutenFree: p.isGlutenFree,
-      naifdaNumber: p.naifdaNumber || "",
-      storageInstructions: p.storageInstructions || "",
-      ingredients: p.ingredients || "",
-      allergens: (p.allergens || []).join("|"),
-      // ── Scalable / weighted product ──
-      isScalable: p.isScalable,
-      scaleUnit: p.scaleUnit || "",
-      pricePerUnit: p.pricePerUnit ?? "",
-      minOrderQty: p.minOrderQty ?? "",
-      maxOrderQty: p.maxOrderQty ?? "",
-      scaleStep: p.scaleStep ?? "",
-      scalePresets: (p.scalePresets || []).join("|"),
-      scaleWareCode: p.scaleWareCode || "",
-      variations: JSON.stringify(
-        (p.variations || []).map((v) => ({
-          id: v.id,
-          label: v.label,
-          quantity: v.quantity,
-          price: v.price,
-          compareAtPrice: v.compareAtPrice,
-          barcode: v.barcode,
-          sku: v.sku,
-          stockQuantity: v.stockQuantity,
-          isDefault: v.isDefault,
-          isActive: v.isActive,
-          sortOrder: v.sortOrder,
-        })),
-      ),
-    }));
+    const csvData = await buildProductExportRows();
 
     const csv = stringify(csvData, {
       header: true,
@@ -217,6 +224,36 @@ export const exportProductsCSV = async (
       `attachment; filename="products-${Date.now()}.csv"`,
     );
     res.send(csv);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── EXPORT PRODUCTS EXCEL ─────────────────────────────────────────────────────
+// Same rows and column order as the CSV export above (buildProductExportRows,
+// PRODUCT_CSV_COLUMNS) — just written as an .xlsx workbook instead, for
+// anyone who'd rather open it straight in Excel/Sheets than a CSV.
+export const exportProductsExcel = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const rows = await buildProductExportRows();
+    const sheet = XLSX.utils.json_to_sheet(rows, { header: [...PRODUCT_CSV_COLUMNS] });
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, sheet, "Products");
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="products-${Date.now()}.xlsx"`,
+    );
+    res.send(buffer);
   } catch (error) {
     next(error);
   }

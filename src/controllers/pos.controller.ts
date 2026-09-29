@@ -1,4 +1,10 @@
 // backend/src/controllers/pos.controller.ts
+import {
+  normalizeYmd,
+  startOfDayWAT,
+  endOfDayWAT,
+  todayYmdWAT,
+} from "../utils/dateRange";
 import { Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AppError, NotFoundError } from "../utils/appError";
@@ -81,6 +87,9 @@ export const createPOSOrder = async (
       customerName,
       customerPhone,
       notes,
+      // Set when this sale was rung up from a cart resumed off a hold — the
+      // leftover draft (OPEN, or still SUSPENDED) gets deleted below.
+      resumedFromOrderId,
     } = req.body;
 
     if (!items || items.length === 0) {
@@ -495,6 +504,33 @@ export const createPOSOrder = async (
 
     await notifyOversold(oversoldEvents);
 
+    // Remove the draft this sale replaced. Resuming a hold flips it to OPEN,
+    // and the frontend used to "void" it afterwards — but voiding is
+    // ADMIN-only, so for every other role that call failed silently and the
+    // draft stayed OPEN forever (a ghost order in the POS list). A draft was
+    // never charged and never touched stock, so it's simply deleted, exactly
+    // like deleting a held order. Best-effort: the sale itself is already
+    // committed, so a cleanup failure must never fail the request.
+    if (typeof resumedFromOrderId === "string" && resumedFromOrderId) {
+      try {
+        const draft = await prisma.pOSOrder.findFirst({
+          where: {
+            id: resumedFromOrderId,
+            status: { in: ["OPEN", "SUSPENDED"] },
+          },
+          select: { id: true },
+        });
+        if (draft) {
+          await prisma.pOSOrderItem.deleteMany({
+            where: { posOrderId: draft.id },
+          });
+          await prisma.pOSOrder.delete({ where: { id: draft.id } });
+        }
+      } catch (cleanupErr) {
+        console.error("Failed to delete resumed POS draft:", cleanupErr);
+      }
+    }
+
     logActivity({
       userId: req.user?.userId,
       action: "create POS sale",
@@ -542,12 +578,10 @@ export const getPOSOrders = async (
     if (staffId) where.processedById = staffId;
     if (startDate || endDate) {
       where.createdAt = {};
-      if (startDate) where.createdAt.gte = new Date(startDate as string);
-      if (endDate) {
-        const end = new Date(endDate as string);
-        end.setHours(23, 59, 59, 999);
-        where.createdAt.lte = end;
-      }
+      const startYmd = normalizeYmd(startDate as string);
+      const endYmd = normalizeYmd(endDate as string);
+      if (startYmd) where.createdAt.gte = startOfDayWAT(startYmd);
+      if (endYmd) where.createdAt.lte = endOfDayWAT(endYmd);
     }
     if (search) {
       where.OR = [
@@ -1152,11 +1186,13 @@ export const getPOSStats = async (
 ) => {
   try {
     const { date } = req.query;
-    const targetDate = date ? new Date(date as string) : new Date();
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+    // Day boundaries in WAT (see utils/dateRange). Stats are COMPLETED-only
+    // by design: held (SUSPENDED), OPEN and VOIDED orders never count
+    // toward sales figures.
+    const ymd = normalizeYmd(date as string) ?? todayYmdWAT();
+    const targetDate = startOfDayWAT(ymd);
+    const startOfDay = startOfDayWAT(ymd);
+    const endOfDay = endOfDayWAT(ymd);
 
     const where = {
       status: "COMPLETED" as const,
@@ -1211,7 +1247,7 @@ export const getPOSStats = async (
     res.status(200).json({
       success: true,
       data: {
-        date: targetDate.toISOString().split("T")[0],
+        date: ymd,
         totalOrders: stats._count.id,
         totalSales: stats._sum.total || 0,
         totalDiscount: stats._sum.discountAmount || 0,
@@ -1807,13 +1843,17 @@ export const deleteSuspendedOrder = async (
 
     const order = await prisma.pOSOrder.findUnique({ where: { id } });
     if (!order) throw new NotFoundError("POS order not found");
-    if (order.status !== "SUSPENDED") {
+    // OPEN is a held order that was resumed but never completed (or whose
+    // cleanup failed). Like SUSPENDED, it never had stock deducted or
+    // payment taken, so it's safe to delete the same way.
+    if (order.status !== "SUSPENDED" && order.status !== "OPEN") {
       throw new AppError(
-        `Cannot delete an order with status "${order.status}". Only SUSPENDED (held) orders can be deleted/cancelled this way.`,
+        `Cannot delete an order with status "${order.status}". Only SUSPENDED (held) or OPEN (unfinished draft) orders can be deleted this way.`,
         400,
       );
     }
 
+    await prisma.pOSOrderItem.deleteMany({ where: { posOrderId: id } });
     await prisma.pOSOrder.delete({ where: { id } });
 
     logActivity({

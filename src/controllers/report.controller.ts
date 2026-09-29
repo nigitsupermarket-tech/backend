@@ -4,8 +4,19 @@ import { Response, NextFunction } from "express";
 import prisma from "../config/database";
 import { AppError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import {
+  normalizeYmd,
+  startOfDayWAT,
+  endOfDayWAT,
+  todayYmdWAT,
+} from "../utils/dateRange";
 
-const PRIVILEGED_ROLES = ["ADMIN", "MANAGER", "ACCOUNTANT"];
+// Roles that can see the whole business (and drill into any user). SALES is
+// the only staff-side role still limited to its own activity.
+const PRIVILEGED_ROLES = ["ADMIN", "MANAGER", "STAFF", "ACCOUNTANT"];
+
+// Staff-side accounts a report can be scoped to.
+const REPORTABLE_ROLES = ["ADMIN", "MANAGER", "STAFF", "SALES", "ACCOUNTANT"];
 
 type Interval = "session" | "today" | "week" | "month" | "year" | "custom";
 
@@ -19,9 +30,8 @@ function resolveRange(
 
   switch (interval) {
     case "today": {
-      const start = new Date(now);
-      start.setHours(0, 0, 0, 0);
-      return { start, end };
+      // Midnight WAT, not server-local midnight.
+      return { start: startOfDayWAT(todayYmdWAT(now)), end };
     }
     case "week": {
       const start = new Date(now);
@@ -44,10 +54,16 @@ function resolveRange(
           "from and to are required for a custom interval",
           400,
         );
-      const start = new Date(from);
-      const customEnd = new Date(to);
-      if (isNaN(start.getTime()) || isNaN(customEnd.getTime()))
-        throw new AppError("from/to must be valid dates", 400);
+      const fromYmd = normalizeYmd(from);
+      const toYmd = normalizeYmd(to);
+      if (!fromYmd || !toYmd)
+        throw new AppError("from/to must be valid dates (YYYY-MM-DD)", 400);
+      // Whole days, inclusive on both ends — so from === to means "that
+      // one day" instead of a zero-width window at midnight.
+      const start = startOfDayWAT(fromYmd);
+      const customEnd = endOfDayWAT(toYmd);
+      if (start > customEnd)
+        throw new AppError("from must be on or before to", 400);
       return { start, end: customEnd };
     }
     case "session":
@@ -71,13 +87,37 @@ function resolveUserScope(req: AuthRequest): {
   const requested = (req.query.userId as string | undefined)?.trim();
 
   if (!PRIVILEGED_ROLES.includes(role)) {
-    // SALES / STAFF can only ever see their own report.
+    // SALES can only ever see their own report.
     return { userId: req.user!.userId, scope: "self" };
   }
 
   if (requested) return { userId: requested, scope: "user" };
   return { userId: undefined, scope: "org" };
 }
+
+// GET /api/v1/reports/users — the picker list for "Specific user". Kept
+// separate from /users (user management) because that one is hierarchy-scoped
+// and closed to ACCOUNTANT, and it also returns customers, which crowded
+// staff out of the picker. Only privileged roles get the list.
+export const getReportUsers = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    if (!PRIVILEGED_ROLES.includes(req.user!.role)) {
+      throw new AppError("Not authorized", 403);
+    }
+    const users = await prisma.user.findMany({
+      where: { role: { in: REPORTABLE_ROLES as any } },
+      select: { id: true, name: true, role: true },
+      orderBy: { name: "asc" },
+    });
+    res.status(200).json({ success: true, data: { users } });
+  } catch (error) {
+    next(error);
+  }
+};
 
 // Reads & clamps page/limit query params shared by every paginated section.
 function resolvePagination(req: AuthRequest): { page: number; limit: number } {
@@ -443,8 +483,22 @@ async function buildSalesSection(
   dateWhere: { gte: Date; lte: Date },
   userId?: string,
 ) {
+  // Online orders aren't processed by staff — Order.userId is the CUSTOMER
+  // who placed it. Filtering it by a staff member's id would silently
+  // return that person's own shopping (usually nothing), which reads as a
+  // broken filter. So a user-scoped report says plainly that online sales
+  // can't be attributed to a user instead of showing misleading numbers.
+  if (userId) {
+    return {
+      orderCount: 0,
+      revenue: 0,
+      averageOrderValue: 0,
+      byStatus: {} as Record<string, number>,
+      attributable: false,
+    };
+  }
+
   const where: any = { createdAt: dateWhere };
-  if (userId) where.userId = userId;
 
   const orders = await prisma.order.findMany({
     where,
@@ -468,6 +522,7 @@ async function buildSalesSection(
     revenue,
     averageOrderValue: orders.length ? revenue / orders.length : 0,
     byStatus,
+    attributable: true,
   };
 }
 
@@ -589,7 +644,6 @@ async function buildProductSalesSection(
         ...productFilter,
         order: {
           createdAt: dateWhere,
-          ...(userId ? { userId } : {}),
         },
       },
       _sum: { quantity: true, subtotal: true },
@@ -612,7 +666,9 @@ async function buildProductSalesSection(
   // Both queries always run (cheap either way) — `source` just decides
   // which results get merged in below, so there's no branching on the
   // query shape itself to keep straight.
-  const includeOnline = source !== "pos";
+  // Online orders can't be attributed to a staff member (see
+  // buildSalesSection), so a user-scoped report is POS-only.
+  const includeOnline = source !== "pos" && !userId;
   const includePos = source !== "online";
 
   // Merge both channels by productSku, NOT productId — once a product is
@@ -778,7 +834,11 @@ async function buildProductSalesDetailSection(
     prisma.orderItem.findMany({
       where: {
         productSku: sku,
-        order: { createdAt: dateWhere, ...(userId ? { userId } : {}) },
+        // Online lines have no staff attribution — for a user-scoped
+        // report match nothing rather than the wrong customer's orders.
+        order: userId
+          ? { id: "000000000000000000000000" }
+          : { createdAt: dateWhere },
       },
       select: {
         id: true,
