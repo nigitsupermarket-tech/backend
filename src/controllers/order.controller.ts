@@ -730,7 +730,8 @@ export const addTrackingUpdate = async (
     // Customer tracking-event notification — respects Settings →
     // Notifications → "Order status email" mode (manual by default).
     const { orderStatusEmailMode } = await getEmailAutomationModes();
-    if (orderStatusEmailMode === "auto") {
+    // order.user is null if the customer's account was deleted.
+    if (orderStatusEmailMode === "auto" && order.user) {
       sendTrackingUpdateEmail(
         order.user.email,
         order.user.name,

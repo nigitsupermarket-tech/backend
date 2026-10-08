@@ -63,6 +63,34 @@ model User {
   @@map("users")
 }
 
+// Snapshot of a user taken at the moment an admin deletes the account, so the
+// account can be removed without losing its history. Deliberately has NO
+// relation to User (the original row is gone). Never contains password or
+// token hashes.
+model ArchivedUser {
+  id                String    @id @default(auto()) @map("_id") @db.ObjectId
+  originalUserId    String    @db.ObjectId
+  email             String
+  name              String
+  phone             String?
+  role              UserRole
+  originalCreatedAt DateTime
+  lastLogin         DateTime?
+
+  deletedAt         DateTime  @default(now())
+  deletedById       String?   @db.ObjectId
+  deletedByName     String?
+  deletedByRole     String?
+
+  counts            Json      // { orders, posOrders, reviews, addresses, ... }
+  snapshot          Json      // profile, addresses, reviews, cart, wishlist, drafts, order summaries
+
+  @@index([originalUserId])
+  @@index([email])
+  @@index([deletedAt])
+  @@map("archived_users")
+}
+
 model VerificationToken {
   id        String   @id @default(auto()) @map("_id") @db.ObjectId
   email     String
@@ -619,7 +647,9 @@ enum PaymentMethod {
 model Order {
   id                String        @id @default(auto()) @map("_id") @db.ObjectId
   orderNumber       String        @unique
-  userId            String        @db.ObjectId
+  // Nullable so an order survives its customer's account being deleted
+  // (see ArchivedUser). customerName/customerEmail keep who it was for.
+  userId            String?       @db.ObjectId
 
   items             OrderItem[]
   status            OrderStatus   @default(PENDING)
@@ -689,7 +719,7 @@ model Order {
   shippedAt         DateTime?
   cancelledAt       DateTime?
 
-  user              User          @relation(fields: [userId], references: [id])
+  user              User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
   appliedDiscount   Discount?     @relation(fields: [discountId], references: [id])
   statusHistory     OrderStatusHistory[]
   trackingUpdates   OrderTrackingUpdate[]
@@ -784,7 +814,8 @@ enum POSPaymentMethod {
 model POSOrder {
   id              String           @id @default(auto()) @map("_id") @db.ObjectId
   posOrderNumber  String           @unique  // e.g., POS-2024-0001
-  processedById   String           @db.ObjectId  // Staff/Admin who processed
+  processedById   String?          @db.ObjectId  // Staff/Admin who processed (null once that account is deleted — see ArchivedUser)
+  processedByName String?          // Snapshot of the cashier's name, filled in when their account is deleted
 
   items           POSOrderItem[]
 
@@ -823,7 +854,7 @@ model POSOrder {
   suspendLabel    String?          // Optional cashier note for the suspended transaction
   sessionId       String?          @db.ObjectId // FK to the POSSession this order was made under (null = made outside any session)
 
-  processedBy     User             @relation(fields: [processedById], references: [id])
+  processedBy     User?            @relation(fields: [processedById], references: [id], onDelete: SetNull)
   voidRequests    VoidApprovalRequest[]
 
   @@map("pos_orders")
