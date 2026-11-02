@@ -893,7 +893,14 @@ export const importProductsCSV = async (
         const created = await prisma.product.create({ data: fullData });
 
         if (variations !== undefined) {
-          await applyProductVariations(created.id, variations, actingUser);
+          // Non-admins can't set a preset's dedicated stock either — that is
+          // a stock write that would skip approval (and pull from the shared
+          // pool). Presets are created on the shared pool; stock comes via
+          // an approval request.
+          const safeVariations = isAdmin
+            ? variations
+            : variations.map((v: any) => ({ ...v, stockQuantity: null }));
+          await applyProductVariations(created.id, safeVariations, actingUser);
         }
 
         let stockApprovalRequestId: string | undefined;
