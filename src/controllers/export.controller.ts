@@ -659,8 +659,11 @@ export const importProductsCSV = async (
           let stockApprovalRequestId: string | undefined;
 
           // Stock change → approval request (everyone except ADMIN)
+          // SALES (like ACCOUNTANT) can never change stock, even by request —
+          // `canCreate` is exactly the ADMIN/MANAGER/STAFF set.
           if (
             !isAdmin &&
+            canCreate &&
             row.stockQuantity !== undefined &&
             row.stockQuantity !== "" &&
             parseInt(row.stockQuantity) !== existing.stockQuantity

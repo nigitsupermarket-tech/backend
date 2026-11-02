@@ -13,14 +13,16 @@ import {
   protect,
   adminOnly,
   staffOrAdmin,
+  stockEditAccess,
 } from "../middlewares/auth.middleware";
 
 const router = Router();
 
 router.use(protect);
 
-// Staff & Admin — submit a request (admin auto-approves)
-router.post("/", staffOrAdmin, createStockRequest);
+// ADMIN / MANAGER / STAFF — submit a request (admin auto-approves).
+// SALES and ACCOUNTANT can never change stock, so they are rejected here.
+router.post("/", stockEditAccess, createStockRequest);
 
 // Admin only — the whole approval queue, including read/history, is now
 // Admin-exclusive (Manager and Accountant previously had read-only access;

@@ -49,6 +49,13 @@ export const restrictTo = (...roles: string[]) => {
 
 export const adminOnly = restrictTo("ADMIN");
 
+// Roles allowed to change (or request a change to) a stock number at all.
+// SALES and ACCOUNTANT are deliberately excluded — they can view stock but
+// never write it, directly or through the approval queue. ADMIN writes
+// directly; MANAGER and STAFF go through admin approval.
+export const STOCK_EDIT_ROLES = ["ADMIN", "MANAGER", "STAFF"] as const;
+export const stockEditAccess = restrictTo(...STOCK_EDIT_ROLES);
+
 // STAFF, ADMIN, SALES, and MANAGER can all access sales-related routes.
 // MANAGER has all STAFF capabilities (plus extra access granted via
 // adminOrManager below for POS sessions / user management).

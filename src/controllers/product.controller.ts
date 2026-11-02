@@ -530,6 +530,13 @@ export const createProduct = async (
       variations,
     } = req.body;
 
+    // SALES / ACCOUNTANT can never write stock, and SALES may not create
+    // products at all (the admin UI already blocks this — enforced here too).
+    const creatorRole = req.user?.role;
+    const isAdminCreator = creatorRole === "ADMIN";
+    if (creatorRole === "SALES")
+      throw new AppError("Your role cannot create products", 403);
+
     // Validate unique slug
     const existingSlug = await prisma.product.findUnique({ where: { slug } });
     if (existingSlug)
@@ -551,9 +558,17 @@ export const createProduct = async (
     // Validate variation barcodes are unique (against other products' own
     // barcode, other products' variation barcodes, and duplicates within
     // this payload) — a barcode must resolve to exactly one scannable thing.
-    const incomingVariations: any[] = Array.isArray(variations)
-      ? variations
-      : [];
+    // Non-admins never write stock directly: any dedicated preset stock is
+    // dropped (the preset starts on the shared pool) and the product's own
+    // initial stock is deferred to an approval request created below.
+    const incomingVariations: any[] = (
+      Array.isArray(variations) ? variations : []
+    ).map((v: any) => (isAdminCreator ? v : { ...v, stockQuantity: null }));
+    const requestedInitialStock: number = isAdminCreator
+      ? 0
+      : Number(stockQuantity) > 0
+        ? Number(stockQuantity)
+        : 0;
     await assertVariationBarcodesAvailable(incomingVariations);
 
     // Validate scale ware code is available — not database-enforced (see
@@ -585,7 +600,7 @@ export const createProduct = async (
         comparePrice,
         costPrice,
         trackInventory: trackInventory ?? true,
-        stockQuantity: stockQuantity ?? 0,
+        stockQuantity: isAdminCreator ? (stockQuantity ?? 0) : 0,
         lowStockThreshold: lowStockThreshold ?? 10,
         allowBackorder: allowBackorder ?? false,
         images: images ?? [],
@@ -645,8 +660,32 @@ export const createProduct = async (
       include: { category: true, brand: true, variations: true },
     });
 
-    // Log inventory if initial stock provided
-    if (stockQuantity && stockQuantity > 0) {
+    // Non-admin creator asked for initial stock → queue it for approval
+    // instead of writing it (same pattern as the CSV import path).
+    if (!isAdminCreator && requestedInitialStock > 0 && req.user?.userId) {
+      const requester = await prisma.user.findUnique({
+        where: { id: req.user.userId },
+        select: { name: true },
+      });
+      await prisma.stockApprovalRequest.create({
+        data: {
+          productId: product.id,
+          productName: product.name,
+          productSku: product.sku,
+          requestedBy: req.user.userId,
+          requestedByName: requester?.name || "Staff",
+          currentQty: 0,
+          requestedQty: requestedInitialStock,
+          reason: `Initial stock for new product by ${requester?.name || "staff"} (${req.user.role})`,
+          source: "PRODUCT_FORM",
+          status: "PENDING",
+        },
+      });
+    }
+
+    // Log inventory if initial stock provided (admin only — non-admin initial
+    // stock is logged when its approval request is approved)
+    if (isAdminCreator && stockQuantity && stockQuantity > 0) {
       const creator = (req as AuthRequest).user?.userId
         ? await prisma.user.findUnique({
             where: { id: (req as AuthRequest).user!.userId },
@@ -714,10 +753,21 @@ export const updateProduct = async (
     } = req.body;
 
     // Security: only admins can directly set stockQuantity via this endpoint.
-    // Staff and Sales must go through the stock-approval workflow.
-    if (req.user?.role !== "ADMIN") {
-      delete rest.stockQuantity;
-    }
+    // MANAGER/STAFF must go through the stock-approval workflow, and
+    // SALES/ACCOUNTANT cannot change stock at all.
+    const isAdminCaller = req.user?.role === "ADMIN";
+    // Pulled out of `rest` so it is applied explicitly (and logged) AFTER
+    // variation transfers, never silently spread into the generic update.
+    const requestedAdminStock: number | undefined =
+      isAdminCaller &&
+      rest.stockQuantity !== undefined &&
+      rest.stockQuantity !== null &&
+      rest.stockQuantity !== ""
+        ? Number(rest.stockQuantity)
+        : undefined;
+    delete rest.stockQuantity;
+    if (requestedAdminStock !== undefined && !(requestedAdminStock >= 0))
+      throw new AppError("Stock quantity cannot be negative", 400);
 
     // If a new images array is supplied, delete any URLs that were removed
     if (Array.isArray(rest.images) && product.images.length > 0) {
@@ -771,9 +821,25 @@ export const updateProduct = async (
     // difference. Sent as `undefined` (field simply absent from the body),
     // variations are left untouched entirely.
     if (variations !== undefined) {
-      const incoming: VariationInput[] = Array.isArray(variations)
+      let incoming: VariationInput[] = Array.isArray(variations)
         ? variations
         : [];
+      if (!isAdminCaller) {
+        // Non-admins can't change any preset's stock: existing presets keep
+        // their stored dedicated stock (whatever the client sent is ignored)
+        // and new presets start on the shared pool. Otherwise this endpoint
+        // would be a back door around the approval workflow — and a
+        // dedicated-stock change also moves the shared pool.
+        const stored = await prisma.productVariation.findMany({
+          where: { productId: id },
+          select: { id: true, stockQuantity: true },
+        });
+        const storedStock = new Map(stored.map((v) => [v.id, v.stockQuantity]));
+        incoming = incoming.map((v) => ({
+          ...v,
+          stockQuantity: v.id ? (storedStock.get(v.id) ?? null) : null,
+        }));
+      }
       const actor = req.user?.userId
         ? await prisma.user.findUnique({
             where: { id: req.user.userId },
@@ -786,7 +852,45 @@ export const updateProduct = async (
       });
     }
 
-    // Update product with all fields
+    // Admin stock change (only present when the admin actually changed it).
+    // Applied after variation transfers so an explicit admin number always
+    // wins, and recorded in the inventory log like every other stock change.
+    if (requestedAdminStock !== undefined) {
+      const live = await prisma.product.findUnique({
+        where: { id },
+        select: { stockQuantity: true },
+      });
+      const liveQty = live?.stockQuantity ?? 0;
+      if (liveQty !== requestedAdminStock) {
+        const actor = req.user?.userId
+          ? await prisma.user.findUnique({
+              where: { id: req.user.userId },
+              select: { name: true },
+            })
+          : null;
+        await prisma.$transaction([
+          prisma.product.update({
+            where: { id },
+            data: { stockQuantity: requestedAdminStock },
+          }),
+          prisma.inventoryLog.create({
+            data: {
+              productId: id,
+              type: "ADJUSTMENT",
+              quantity: Math.abs(requestedAdminStock - liveQty),
+              previousQty: liveQty,
+              newQty: requestedAdminStock,
+              reason: "Product form edit by admin",
+              reference: `admin:${req.user?.userId}`,
+              performedBy: req.user?.userId,
+              performedByName: actor?.name || "Admin",
+            },
+          }),
+        ]);
+      }
+    }
+
+    // Update product with all fields (stockQuantity is handled above)
     const updated = await prisma.product.update({
       where: { id },
       data: {

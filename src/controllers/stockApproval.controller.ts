@@ -5,6 +5,111 @@ import { AppError, NotFoundError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
 import { log as logActivity } from "../utils/activityLogger";
 import { sendAdminStockNotificationEmail } from "../services/email.service";
+import { runWithRetry } from "../lib/stockSafety";
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Applies an approved request to the LIVE stock figure.
+//
+// A request stores the quantity the product had when it was submitted
+// (`currentQty`) and the quantity the requester wants (`requestedQty`).
+// Writing `requestedQty` verbatim at approval time — what this used to do —
+// silently wipes out every sale, return or other adjustment that happened
+// between submission and approval, which is exactly how the product list and
+// the product details page ended up disagreeing. Instead the REQUESTED CHANGE
+// (requestedQty - currentQty) is applied on top of whatever the stock is now,
+// floored at 0. When nothing moved in between, the result is identical to the
+// old behaviour (live === currentQty → live + delta === requestedQty).
+// ─────────────────────────────────────────────────────────────────────────────
+async function applyApprovedRequest(
+  request: {
+    id: string;
+    productId: string;
+    variationId: string | null;
+    currentQty: number;
+    requestedQty: number;
+    reason: string | null;
+  },
+  admin: { id: string; name: string },
+  reasonPrefix: string,
+  reviewNote?: string | null,
+) {
+  await runWithRetry(() =>
+    prisma.$transaction(async (tx) => {
+      let liveQty: number;
+      if (request.variationId) {
+        const v = await tx.productVariation.findUnique({
+          where: { id: request.variationId },
+          select: { stockQuantity: true },
+        });
+        if (!v) throw new NotFoundError("Variation no longer exists");
+        liveQty = v.stockQuantity ?? 0;
+      } else {
+        const p = await tx.product.findUnique({
+          where: { id: request.productId },
+          select: { stockQuantity: true },
+        });
+        if (!p) throw new NotFoundError("Product no longer exists");
+        liveQty = p.stockQuantity;
+      }
+
+      const delta = request.requestedQty - request.currentQty;
+      const newQty = Math.max(0, liveQty + delta);
+      const drifted = liveQty !== request.currentQty;
+
+      if (request.variationId) {
+        await tx.productVariation.update({
+          where: { id: request.variationId },
+          data: { stockQuantity: newQty },
+        });
+      } else {
+        await tx.product.update({
+          where: { id: request.productId },
+          data: { stockQuantity: newQty },
+        });
+      }
+
+      const variation = request.variationId
+        ? await tx.productVariation.findUnique({
+            where: { id: request.variationId },
+            select: { label: true },
+          })
+        : null;
+
+      await tx.inventoryLog.create({
+        data: {
+          productId: request.productId,
+          type: "ADJUSTMENT",
+          quantity: Math.abs(newQty - liveQty),
+          previousQty: liveQty,
+          newQty,
+          reason:
+            `${reasonPrefix}` +
+            (drifted
+              ? ` (stock moved from ${request.currentQty} to ${liveQty} since the request was made — requested change of ${delta >= 0 ? "+" : ""}${delta} applied to the live figure)`
+              : ""),
+          reference: `approval:${request.id}`,
+          variationId: request.variationId ?? undefined,
+          variationLabel: variation?.label ?? undefined,
+          stockMode: request.variationId ? "DEDICATED" : undefined,
+          performedBy: admin.id,
+          performedByName: admin.name,
+        },
+      });
+
+      await tx.stockApprovalRequest.update({
+        where: { id: request.id },
+        data: {
+          status: "APPROVED",
+          reviewedBy: admin.id,
+          reviewedByName: admin.name,
+          reviewedAt: new Date(),
+          reviewNote: reviewNote || null,
+        },
+      });
+    }),
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/v1/stock-approvals
@@ -17,6 +122,11 @@ export const createStockRequest = async (
 ) => {
   try {
     const { productId, requestedQty, reason, source, variationId } = req.body;
+
+    // Defence in depth — the route already restricts this, but SALES and
+    // ACCOUNTANT must never be able to change stock by any path.
+    if (!["ADMIN", "MANAGER", "STAFF"].includes(req.user!.role))
+      throw new AppError("Your role is not allowed to change stock", 403);
 
     if (requestedQty === undefined || requestedQty < 0)
       throw new AppError("requestedQty must be >= 0", 400);
@@ -256,46 +366,13 @@ export const approveStockRequest = async (
       where: { id: req.user!.userId },
     });
 
-    // Apply the stock change + mark approved atomically — to the specific
-    // variation's dedicated stock if this request targeted one, otherwise
-    // to the product's shared "per unit" pool.
-    await prisma.$transaction([
-      request.variationId
-        ? prisma.productVariation.update({
-            where: { id: request.variationId },
-            data: { stockQuantity: request.requestedQty },
-          })
-        : prisma.product.update({
-            where: { id: request.productId },
-            data: { stockQuantity: request.requestedQty },
-          }),
-      prisma.inventoryLog.create({
-        data: {
-          productId: request.productId,
-          type: "ADJUSTMENT",
-          quantity: Math.abs(request.requestedQty - request.currentQty),
-          previousQty: request.currentQty,
-          newQty: request.requestedQty,
-          reason: `Approved by ${admin?.name || "admin"} — ${request.reason || "stock adjustment"}`,
-          reference: `approval:${id}`,
-          variationId: request.variationId ?? undefined,
-          variationLabel: request.variationLabel ?? undefined,
-          stockMode: request.variationId ? "DEDICATED" : undefined,
-          performedBy: req.user!.userId,
-          performedByName: admin?.name || "Admin",
-        },
-      }),
-      prisma.stockApprovalRequest.update({
-        where: { id },
-        data: {
-          status: "APPROVED",
-          reviewedBy: req.user!.userId,
-          reviewedByName: admin?.name || "Admin",
-          reviewedAt: new Date(),
-          reviewNote: reviewNote || null,
-        },
-      }),
-    ]);
+    // Apply the requested change to the live stock + mark approved atomically.
+    await applyApprovedRequest(
+      request,
+      { id: req.user!.userId, name: admin?.name || "Admin" },
+      `Approved by ${admin?.name || "admin"} — ${request.reason || "stock adjustment"}`,
+      reviewNote,
+    );
 
     logActivity({
       userId: req.user!.userId,
@@ -391,43 +468,12 @@ export const bulkApproveStockRequests = async (
 
     for (const request of requests) {
       try {
-        await prisma.$transaction([
-          request.variationId
-            ? prisma.productVariation.update({
-                where: { id: request.variationId },
-                data: { stockQuantity: request.requestedQty },
-              })
-            : prisma.product.update({
-                where: { id: request.productId },
-                data: { stockQuantity: request.requestedQty },
-              }),
-          prisma.inventoryLog.create({
-            data: {
-              productId: request.productId,
-              type: "ADJUSTMENT",
-              quantity: Math.abs(request.requestedQty - request.currentQty),
-              previousQty: request.currentQty,
-              newQty: request.requestedQty,
-              reason: `Bulk approved by ${admin?.name || "admin"}`,
-              reference: `approval:${request.id}`,
-              variationId: request.variationId ?? undefined,
-              variationLabel: request.variationLabel ?? undefined,
-              stockMode: request.variationId ? "DEDICATED" : undefined,
-              performedBy: req.user!.userId,
-              performedByName: admin?.name || "Admin",
-            },
-          }),
-          prisma.stockApprovalRequest.update({
-            where: { id: request.id },
-            data: {
-              status: "APPROVED",
-              reviewedBy: req.user!.userId,
-              reviewedByName: admin?.name || "Admin",
-              reviewedAt: new Date(),
-              reviewNote: reviewNote || null,
-            },
-          }),
-        ]);
+        await applyApprovedRequest(
+          request,
+          { id: req.user!.userId, name: admin?.name || "Admin" },
+          `Bulk approved by ${admin?.name || "admin"}`,
+          reviewNote,
+        );
         approved++;
       } catch {
         skipped++;

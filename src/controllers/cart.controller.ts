@@ -10,6 +10,7 @@ import {
   resolveVariationLine,
   assertVariationStock,
 } from "../lib/productVariation";
+import { repairCartIndexes } from "../lib/cartIndexes";
 
 const IS_PROD = process.env.NODE_ENV === "production";
 
@@ -39,25 +40,42 @@ async function findOrCreateCart(
   let cart = await prisma.cart.findFirst({ where });
   if (cart) return cart;
 
+  const isDup = (e: any) => e?.code === "P2002" || e?.code === 11000;
+
   try {
     cart = await prisma.cart.create({
       data: userId ? { userId } : { sessionId },
     });
     return cart;
   } catch (err: any) {
-    if (err?.code === "P2002" || err?.code === 11000) {
-      // Someone else created this exact cart a moment ago (double-click,
-      // two tabs, etc). Re-read it — retry once with a brief delay in case
-      // of read-after-write lag, then surface the error if it genuinely
-      // isn't there (which now indicates a real problem, not the old
-      // structural index bug).
-      for (const delayMs of [0, 150]) {
-        if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+    if (!isDup(err)) throw err;
+
+    // 1) Genuine race (double-click, two tabs): the same cart now exists.
+    for (const delayMs of [0, 150]) {
+      if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+      const existing = await prisma.cart.findFirst({ where });
+      if (existing) return existing;
+    }
+
+    // 2) The cart is NOT there, yet the insert hit a duplicate key: that is
+    // the plain-unique-index bug (a different cart already "owns" null).
+    // `prisma db push` can silently bring that index back, so repair it
+    // here and retry once instead of failing the customer.
+    console.error(
+      "[cart] duplicate key with no matching cart — repairing indexes",
+    );
+    await repairCartIndexes();
+    try {
+      return await prisma.cart.create({
+        data: userId ? { userId } : { sessionId },
+      });
+    } catch (retryErr: any) {
+      if (isDup(retryErr)) {
         const existing = await prisma.cart.findFirst({ where });
         if (existing) return existing;
       }
+      throw retryErr;
     }
-    throw err;
   }
 }
 
@@ -179,7 +197,10 @@ export const addToCart = async (
         const available = product.isScalable
           ? `${product.stockQuantity} ${unit}`
           : `${product.stockQuantity} unit${product.stockQuantity === 1 ? "" : "s"}`;
-        throw new AppError(`Only ${available} of ${product.name} available`, 400);
+        throw new AppError(
+          `Only ${available} of ${product.name} available`,
+          400,
+        );
       }
       itemPrice =
         product.isScalable && product.pricePerUnit
@@ -298,7 +319,10 @@ export const updateCartItem = async (
 
     if (item.variationId) {
       // ── Structured preset/variation — quantity is a PACK COUNT ──────────
-      const variation = findActiveVariation(item.product as any, item.variationId);
+      const variation = findActiveVariation(
+        item.product as any,
+        item.variationId,
+      );
       if (quantity < 1) {
         throw new AppError(`Minimum quantity is 1 ${variation.label}`, 400);
       }

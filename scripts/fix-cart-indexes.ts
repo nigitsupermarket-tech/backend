@@ -43,61 +43,15 @@
 //    or: npm run fix-cart-indexes
 
 import prisma from "../src/config/database";
+import { repairCartIndexes } from "../src/lib/cartIndexes";
 
 async function main() {
   console.log("🔧 Fixing Cart userId/sessionId indexes...\n");
 
-  // ── 1. Drop any existing indexes on these fields (names may vary slightly
-  //       across Prisma/Mongo versions, so drop by key spec via listIndexes) ──
-  const existing = (await prisma.$runCommandRaw({
-    listIndexes: "carts",
-  })) as any;
-
-  const indexNames: string[] = (existing?.cursor?.firstBatch || [])
-    .filter((idx: any) => {
-      const keys = Object.keys(idx.key || {});
-      return (
-        (keys.length === 1 && keys[0] === "userId") ||
-        (keys.length === 1 && keys[0] === "sessionId")
-      );
-    })
-    .map((idx: any) => idx.name);
-
-  for (const name of indexNames) {
-    console.log(`  Dropping existing index: ${name}`);
-    try {
-      await prisma.$runCommandRaw({ dropIndexes: "carts", index: name });
-    } catch (err: any) {
-      console.warn(`  ⚠️  Could not drop ${name}:`, err?.message || err);
-    }
-  }
-
-  // ── 2. Recreate as partial unique indexes ─────────────────────────────
-  console.log("  Creating partial unique index on userId...");
-  await prisma.$runCommandRaw({
-    createIndexes: "carts",
-    indexes: [
-      {
-        key: { userId: 1 },
-        name: "carts_userId_partial_unique",
-        unique: true,
-        partialFilterExpression: { userId: { $exists: true } },
-      },
-    ],
-  });
-
-  console.log("  Creating partial unique index on sessionId...");
-  await prisma.$runCommandRaw({
-    createIndexes: "carts",
-    indexes: [
-      {
-        key: { sessionId: 1 },
-        name: "carts_sessionId_partial_unique",
-        unique: true,
-        partialFilterExpression: { sessionId: { $exists: true } },
-      },
-    ],
-  });
+  // 1+2. Drop plain unique indexes, create partial ones (idempotent) —
+  //      shared with the API's self-heal in cart.controller.ts.
+  const changed = await repairCartIndexes();
+  console.log(changed ? "  Indexes repaired." : "  Indexes already correct.");
 
   // ── 3. De-duplicate any carts that were already split by the bug ───────
   // (Two Cart rows for the same userId, or same sessionId, that both slipped
