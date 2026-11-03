@@ -16,6 +16,7 @@ import {
   sendWelcomeEmail,
 } from "../services/email.service";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import { REVOKE_SESSIONS } from "../utils/password";
 
 // ─── Cookie helpers ───────────────────────────────────────────────────────────
 
@@ -625,7 +626,7 @@ export const resetPassword = async (
 
     await prisma.user.update({
       where: { email: resetToken.email },
-      data: { password: hashedPassword, refreshToken: null },
+      data: { password: hashedPassword, ...REVOKE_SESSIONS },
     });
 
     await prisma.verificationToken.delete({ where: { id: resetToken.id } });
@@ -709,7 +710,7 @@ export const updatePassword = async (
 
     await prisma.user.update({
       where: { id: user.id },
-      data: { password: hashedPassword, refreshToken: null },
+      data: { password: hashedPassword, ...REVOKE_SESSIONS },
     });
 
     clearAuthCookies(res);

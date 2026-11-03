@@ -5,6 +5,7 @@ import {
   createUser,
   updateUser,
   deleteUser,
+  resetUserPassword,
 } from "../controllers/user.controller";
 import {
   protect,
@@ -36,6 +37,10 @@ router.get("/:id", getUser);
 // controller (ADMIN/MANAGER/STAFF for role changes, or self for profile
 // fields).
 router.put("/:id", updateUser);
+
+// Reset another user's password (set directly or email a link) — ADMIN,
+// MANAGER, STAFF; rank rules enforced in the controller.
+router.post("/:id/reset-password", userManagementAccess, resetUserPassword);
 
 router.delete("/:id", adminOnly, deleteUser);
 

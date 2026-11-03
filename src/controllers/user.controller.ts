@@ -4,11 +4,18 @@ import prisma from "../config/database";
 import { AppError, NotFoundError, ConflictError } from "../utils/appError";
 import { AuthRequest } from "../middlewares/auth.middleware";
 import { log as logActivity } from "../utils/activityLogger";
+import { v4 as uuidv4 } from "uuid";
+import { sendPasswordResetEmail } from "../services/email.service";
+import {
+  assertStrongPassword,
+  REVOKE_SESSIONS,
+} from "../utils/password";
 import {
   canAssignRole,
   canViewRole,
   rolesAbove,
   USER_MANAGEMENT_ROLES,
+  rankOf,
 } from "../utils/roleHierarchy";
 
 export const getUsers = async (
@@ -166,6 +173,9 @@ export const createUser = async (
     if (existing)
       throw new ConflictError("User with this email already exists");
 
+    // Same strength rule as self-registration / reset (this route had none).
+    assertStrongPassword(password);
+
     const hashed = await bcrypt.hash(password, 12);
 
     const user = await prisma.user.create({
@@ -311,6 +321,112 @@ export const updateUser = async (
     res
       .status(200)
       .json({ success: true, message: "User updated", data: { user } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /users/:id/reset-password
+//
+// An admin/manager/staff member resetting ANOTHER user's password. Two modes:
+//   { mode: "set",  password }  — set it directly (the admin hands it over)
+//   { mode: "link" }            — email the user a one-hour reset link
+// Who may reset whom follows the role hierarchy: ADMIN anyone; MANAGER/STAFF
+// only accounts strictly below their own rank (never a peer or superior).
+// Nobody resets their OWN password here — that needs the current password
+// (PUT /auth/update-password) or the forgot-password email flow.
+// Every successful reset ends the target's existing sessions.
+export const resetUserPassword = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const id = req.params.id as string;
+    const actorRole = req.user?.role || "";
+    const { mode, password } = req.body as {
+      mode?: "set" | "link";
+      password?: string;
+    };
+
+    if (!USER_MANAGEMENT_ROLES.includes(actorRole))
+      throw new AppError("Not authorized", 403);
+    if (req.user?.userId === id)
+      throw new AppError(
+        "Use My Account → Change Password to change your own password",
+        400,
+      );
+
+    const target = await prisma.user.findUnique({
+      where: { id },
+      select: { id: true, name: true, email: true, role: true },
+    });
+    if (!target) throw new NotFoundError("User not found");
+
+    if (actorRole !== "ADMIN" && rankOf(target.role) <= rankOf(actorRole))
+      throw new AppError(
+        `${actorRole.charAt(0) + actorRole.slice(1).toLowerCase()}s cannot reset the password of a ${target.role} account`,
+        403,
+      );
+
+    if (mode === "link") {
+      await prisma.verificationToken.deleteMany({
+        where: { email: target.email, type: "password_reset" },
+      });
+      const token = uuidv4();
+      await prisma.verificationToken.create({
+        data: {
+          email: target.email,
+          token,
+          type: "password_reset",
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        },
+      });
+      try {
+        await sendPasswordResetEmail(target.email, target.name, token);
+      } catch (emailErr) {
+        console.error("Admin-initiated reset email failed:", emailErr);
+        throw new AppError(
+          "Could not send the reset email. Check the email settings, or set a password directly instead.",
+          502,
+        );
+      }
+    } else if (mode === "set") {
+      assertStrongPassword(password);
+      await prisma.user.update({
+        where: { id },
+        data: { password: await bcrypt.hash(password, 12), ...REVOKE_SESSIONS },
+      });
+      // Any pending emailed link is now stale.
+      await prisma.verificationToken.deleteMany({
+        where: { email: target.email, type: "password_reset" },
+      });
+    } else {
+      throw new AppError('mode must be "set" or "link"', 400);
+    }
+
+    // The password itself is never logged — only that a reset happened.
+    logActivity({
+      userId: req.user?.userId,
+      action: "reset user password",
+      entity: "user",
+      entityId: target.id,
+      metadata: {
+        targetName: target.name,
+        targetEmail: target.email,
+        method: mode === "link" ? "emailed reset link" : "set by admin",
+        performedByRole: actorRole,
+      },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message:
+        mode === "link"
+          ? `Reset link emailed to ${target.email}`
+          : `Password updated for ${target.name}. Their active sessions were ended.`,
+    });
   } catch (error) {
     next(error);
   }
