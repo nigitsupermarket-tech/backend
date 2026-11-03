@@ -504,7 +504,7 @@ export const importProductsCSV = async (
       price: parseFloat(row.price) || 0,
       comparePrice: row.comparePrice ? parseFloat(row.comparePrice) : null,
       costPrice: row.costPrice ? parseFloat(row.costPrice) : null,
-      stockQuantity: parseInt(row.stockQuantity) || 0,
+      stockQuantity: parseFloat(row.stockQuantity) || 0,
       lowStockThreshold: parseInt(row.lowStockThreshold) || 5,
       // categoryId/brandId deliberately NOT included here — see the
       // explicit connect-based handling right before create/update below.
@@ -666,9 +666,9 @@ export const importProductsCSV = async (
             canCreate &&
             row.stockQuantity !== undefined &&
             row.stockQuantity !== "" &&
-            parseInt(row.stockQuantity) !== existing.stockQuantity
+            parseFloat(row.stockQuantity) !== existing.stockQuantity
           ) {
-            const requestedQty = parseInt(row.stockQuantity);
+            const requestedQty = parseFloat(row.stockQuantity);
             if (isNaN(requestedQty) || requestedQty < 0) {
               throw new Error(`Invalid stockQuantity: ${row.stockQuantity}`);
             }

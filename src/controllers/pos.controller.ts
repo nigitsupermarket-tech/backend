@@ -338,13 +338,22 @@ export const createPOSOrder = async (
                             channel: "POS",
                           };
                         }
+                        // Log the REAL before/after: read the stock after our own
+                        // guarded decrement instead of trusting the pre-transaction
+                        // snapshot (stale if another sale landed meanwhile).
+                        const afterVar = await tx.productVariation.findUnique({
+                          where: { id: variation.id },
+                          select: { stockQuantity: true },
+                        });
+                        const newVarQty =
+                          afterVar?.stockQuantity ?? prevQty - resolved.packCount;
                         await tx.inventoryLog.create({
                           data: {
                             productId: product.id,
                             type: "POS_SALE",
                             quantity: -resolved.packCount,
-                            previousQty: prevQty,
-                            newQty: prevQty - resolved.packCount,
+                            previousQty: newVarQty + resolved.packCount,
+                            newQty: newVarQty,
                             reason: `POS sale — ${variation.label}`,
                             reference: posOrderNumber,
                             variationId: variation.id,
@@ -403,13 +412,20 @@ export const createPOSOrder = async (
                           channel: "POS",
                         };
                       }
+                      const afterShared = await tx.product.findUnique({
+                        where: { id: product.id },
+                        select: { stockQuantity: true },
+                      });
+                      const newSharedQty =
+                        afterShared?.stockQuantity ??
+                        product.stockQuantity - resolved.baseQty;
                       await tx.inventoryLog.create({
                         data: {
                           productId: product.id,
                           type: "POS_SALE",
                           quantity: -resolved.baseQty,
-                          previousQty: product.stockQuantity,
-                          newQty: product.stockQuantity - resolved.baseQty,
+                          previousQty: newSharedQty + resolved.baseQty,
+                          newQty: newSharedQty,
                           reason: `POS sale — ${variation.label}`,
                           reference: posOrderNumber,
                           variationId: variation.id,
@@ -468,13 +484,20 @@ export const createPOSOrder = async (
                         channel: "POS",
                       };
                     }
+                    const afterLegacy = await tx.product.findUnique({
+                      where: { id: product.id },
+                      select: { stockQuantity: true },
+                    });
+                    const newLegacyQty =
+                      afterLegacy?.stockQuantity ??
+                      product.stockQuantity - item.quantity;
                     await tx.inventoryLog.create({
                       data: {
                         productId: product.id,
                         type: "POS_SALE",
                         quantity: -item.quantity,
-                        previousQty: product.stockQuantity,
-                        newQty: product.stockQuantity - item.quantity,
+                        previousQty: newLegacyQty + item.quantity,
+                        newQty: newLegacyQty,
                         reason: "POS sale",
                         reference: posOrderNumber,
                         performedBy: staffId,
@@ -716,114 +739,94 @@ const executeVoidOrder = async (
 
   await prisma.$transaction(
     async (tx) => {
-      // 1. Mark voided
-      await tx.pOSOrder.update({
-        where: { id },
+      // 1. Mark voided — ATOMICALLY, only if it is still in the status we
+      //    read above. Two admins voiding (or an approval + a direct void)
+      //    at the same moment would otherwise both restore the same stock.
+      const claimed = await tx.pOSOrder.updateMany({
+        where: { id, status: order.status },
         data: {
           status: "VOIDED",
           voidedAt: new Date(),
           notes: reason ?? order.notes,
         },
       });
+      if (claimed.count === 0) {
+        throw new AppError("Order was already voided or changed", 409);
+      }
 
       // 2. Restore stock — only for COMPLETED orders (hold/suspended
-      //    orders never had stock deducted, so no restoration needed).
+      //    orders never had stock deducted, so no restoration needed), and
+      //    only for products that track inventory (an untracked product
+      //    never had stock deducted, so "restoring" it would inflate it).
+      //    Sequential: voids are rare/admin-only, and each log needs the
+      //    real stock figure at the moment of the restore.
       if (restoreStock && orderItems.length > 0) {
-        await Promise.all(
-          orderItems.map((item) => {
-            const product = productMap.get(item.productId ?? "");
-            // Same narrowing reasoning as orderStock.ts: `product` only
-            // came from a real string key, so item.productId must be
-            // non-null here — but InventoryLog.productId is required, so
-            // TypeScript still needs this spelled out explicitly.
-            const productId = item.productId;
-            if (!product || !productId) return Promise.resolve();
+        for (const item of orderItems) {
+          const product = productMap.get(item.productId ?? "");
+          const productId = item.productId;
+          if (!product || !productId || !product.trackInventory) continue;
 
-            if (item.variationId) {
-              const variation = variationMap.get(item.variationId);
-              const label =
-                item.variationLabel || variation?.label || "variation";
+          const variation = item.variationId
+            ? variationMap.get(item.variationId)
+            : undefined;
+          const label = item.variationLabel || variation?.label || "variation";
+          const why = `POS void: ${reason || "no reason"}`;
 
-              if (item.stockMode === "DEDICATED" && variation) {
-                const prevQty = variation.stockQuantity ?? 0;
-                return Promise.all([
-                  tx.productVariation.update({
-                    where: { id: item.variationId as string },
-                    data: { stockQuantity: { increment: item.quantity } },
-                  }),
-                  tx.inventoryLog.create({
-                    data: {
-                      productId,
-                      type: "RETURN",
-                      quantity: item.quantity,
-                      previousQty: prevQty,
-                      newQty: prevQty + item.quantity,
-                      reason: `POS void: ${reason || "no reason"} — ${label}`,
-                      reference: order.posOrderNumber,
-                      variationId: item.variationId,
-                      variationLabel: label,
-                      stockMode: "DEDICATED",
-                      performedBy: performedBy,
-                    },
-                  }),
-                ]);
-              }
+          if (item.variationId && item.stockMode === "DEDICATED" && variation) {
+            const updated = await tx.productVariation.update({
+              where: { id: item.variationId },
+              data: { stockQuantity: { increment: item.quantity } },
+              select: { stockQuantity: true },
+            });
+            const newQty = updated.stockQuantity ?? item.quantity;
+            await tx.inventoryLog.create({
+              data: {
+                productId,
+                type: "RETURN",
+                quantity: item.quantity,
+                previousQty: newQty - item.quantity,
+                newQty,
+                reason: `${why} — ${label}`,
+                reference: order.posOrderNumber,
+                variationId: item.variationId,
+                variationLabel: label,
+                stockMode: "DEDICATED",
+                performedBy: performedBy,
+              },
+            });
+            continue;
+          }
 
-              // SHARED mode — item.quantity is a PACK COUNT, so convert
-              // back to the base scaleUnit amount before restoring.
-              const baseQty = variation
-                ? variation.quantity * item.quantity
-                : item.quantity;
-              return Promise.all([
-                tx.product.update({
-                  where: { id: productId },
-                  data: {
-                    stockQuantity: { increment: baseQty },
-                    salesCount: { decrement: item.quantity },
-                  },
-                }),
-                tx.inventoryLog.create({
-                  data: {
-                    productId,
-                    type: "RETURN",
-                    quantity: baseQty,
-                    previousQty: product.stockQuantity,
-                    newQty: product.stockQuantity + baseQty,
-                    reason: `POS void: ${reason || "no reason"} — ${label}`,
-                    reference: order.posOrderNumber,
-                    variationId: item.variationId,
-                    variationLabel: label,
-                    stockMode: "SHARED",
-                    performedBy: performedBy,
-                  },
-                }),
-              ]);
-            }
-
-            // Legacy fixed / free-form custom-weight line — unchanged.
-            return Promise.all([
-              tx.product.update({
-                where: { id: productId },
-                data: {
-                  stockQuantity: { increment: item.quantity },
-                  salesCount: { decrement: item.quantity },
-                },
-              }),
-              tx.inventoryLog.create({
-                data: {
-                  productId,
-                  type: "RETURN",
-                  quantity: item.quantity,
-                  previousQty: product.stockQuantity,
-                  newQty: product.stockQuantity + item.quantity,
-                  reason: `POS void: ${reason || "no reason"}`,
-                  reference: order.posOrderNumber,
-                  performedBy: performedBy,
-                },
-              }),
-            ]);
-          }),
-        );
+          // SHARED variation (item.quantity is a PACK COUNT → convert back to
+          // the base scaleUnit amount) or a legacy/free-form line.
+          const baseQty =
+            item.variationId && variation
+              ? variation.quantity * item.quantity
+              : item.quantity;
+          const updated = await tx.product.update({
+            where: { id: productId },
+            data: {
+              stockQuantity: { increment: baseQty },
+              salesCount: { decrement: item.quantity },
+            },
+            select: { stockQuantity: true },
+          });
+          await tx.inventoryLog.create({
+            data: {
+              productId,
+              type: "RETURN",
+              quantity: baseQty,
+              previousQty: updated.stockQuantity - baseQty,
+              newQty: updated.stockQuantity,
+              reason: item.variationId ? `${why} — ${label}` : why,
+              reference: order.posOrderNumber,
+              variationId: item.variationId ?? undefined,
+              variationLabel: item.variationId ? label : undefined,
+              stockMode: item.variationId ? "SHARED" : undefined,
+              performedBy: performedBy,
+            },
+          });
+        }
       }
     },
     {

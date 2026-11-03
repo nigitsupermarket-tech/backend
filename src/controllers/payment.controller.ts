@@ -9,7 +9,7 @@ import {
   sendBankTransferInstructionsEmail,
   sendBankTransferConfirmedEmail,
 } from "../services/email.service";
-import { deductStockForOrder, restoreStockForOrder } from "../lib/orderStock";
+import { deductStockWithRetry, restoreStockForOrder } from "../lib/orderStock";
 import { maybeSendInvoiceEmail } from "./order.controller";
 
 const PAYSTACK_SECRET = () => process.env.PAYSTACK_SECRET_KEY!;
@@ -181,9 +181,7 @@ export const verifyPayment = async (
 
         // Stock is deducted here, at payment confirmation — not at order
         // creation — so abandoned/unpaid orders never tie up inventory.
-        deductStockForOrder(metadata.orderId).catch((err) =>
-          console.error("[stock] Deduction failed:", err),
-        );
+        await deductStockWithRetry(metadata.orderId);
 
         // Invoice email — guarded by invoiceEmailSent, so this is a no-op
         // if it already went out at order creation (invoiceEmailMode=auto).
@@ -251,9 +249,7 @@ export const paystackWebhook = async (
             }),
           ]);
 
-          deductStockForOrder(metadata.orderId).catch((err) =>
-            console.error("[stock] Deduction failed:", err),
-          );
+          await deductStockWithRetry(metadata.orderId);
           maybeSendInvoiceEmail(metadata.orderId).catch((err) =>
             console.error("[email] Order confirmation failed:", err),
           );
@@ -421,9 +417,7 @@ export const confirmBankTransfer = async (
 
     // Stock is deducted here, at payment confirmation — not at order
     // creation — so abandoned/unpaid orders never tie up inventory.
-    deductStockForOrder(orderId).catch((err) =>
-      console.error("[stock] Deduction failed:", err),
-    );
+    await deductStockWithRetry(orderId, req.user?.userId ? { id: req.user.userId } : undefined);
 
     // Notify customer — respects Settings → Notifications → "Order status
     // email" mode (manual by default; staff sends it via "Notify Customer"

@@ -309,7 +309,12 @@ model Product {
 
   // Inventory
   trackInventory    Boolean       @default(true)
-  stockQuantity     Int           @default(0)
+  // Float, not Int: scalable products are sold/stocked in decimals (e.g. 1.5 kg,
+  // minOrderQty 0.1) and the guarded decrement/increment in POS, online orders
+  // and approvals rejects a fractional value on an Int field. MongoDB stores
+  // the existing whole numbers as-is, so no data migration is needed — just
+  // run `prisma generate` on deploy.
+  stockQuantity     Float         @default(0)
   lowStockThreshold Int           @default(10)
   allowBackorder    Boolean       @default(false)
 

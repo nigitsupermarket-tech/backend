@@ -194,13 +194,15 @@ export const updateOrderStatus = async (
       }),
     ]);
 
-    if (status === "CANCELLED") {
+    if (status === "CANCELLED" || status === "REFUNDED") {
       // Only restores stock if it was actually deducted (i.e. payment had
       // been confirmed) — orders cancelled before payment never touched
       // inventory, so there's nothing to give back.
       await restoreStockForOrder(
         id,
-        "Order cancelled by staff",
+        status === "REFUNDED"
+          ? "Order refunded by staff"
+          : "Order cancelled by staff",
         req.user?.userId
           ? { id: req.user.userId, name: req.user.email }
           : undefined,

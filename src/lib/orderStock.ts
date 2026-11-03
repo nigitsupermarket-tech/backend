@@ -51,18 +51,6 @@ export async function deductStockForOrder(
   });
   const productMap = new Map(products.map((p) => [p.id, p]));
 
-  // Variation items need their own record fetched to know current dedicated
-  // stock (previousQty) before decrementing.
-  const variationIds = order.items
-    .filter((i) => i.variationId)
-    .map((i) => i.variationId as string);
-  const variations = variationIds.length
-    ? await prisma.productVariation.findMany({
-        where: { id: { in: variationIds } },
-      })
-    : [];
-  const variationMap = new Map(variations.map((v) => [v.id, v]));
-
   const oversoldEvents = await runWithRetry(() =>
     prisma.$transaction(async (tx) => {
       // Scoped inside the transaction (not declared outside it) and
@@ -70,6 +58,19 @@ export async function deductStockForOrder(
       // retry re-runs this whole callback from scratch, and an
       // outer-scoped array would double up entries across attempts.
       const events: OversoldEvent[] = [];
+
+      // ATOMIC claim of the "deduct once" flag. The check at the top of this
+      // function is read-then-write, so Paystack's verify call and its
+      // webhook arriving together can both pass it. Whichever transaction
+      // loses the write-conflict is retried by runWithRetry and re-runs this
+      // callback — without this claim it would deduct a second time. Here
+      // only the transaction that actually flips false→true proceeds.
+      const claim = await tx.order.updateMany({
+        where: { id: orderId, stockDeducted: false },
+        data: { stockDeducted: true },
+      });
+      if (claim.count === 0) return events;
+
       for (const item of order.items) {
         const product = productMap.get(item.productId ?? "");
         // Narrow once, right after the lookup: `product` was only found
@@ -82,9 +83,22 @@ export async function deductStockForOrder(
         const productId = item.productId;
         if (!product || !productId || !product.trackInventory) continue; // don't track untracked products
 
+        // Live figures read INSIDE the transaction, so the log's
+        // previousQty/newQty reflect the real stock at deduction time (the
+        // snapshot taken before the transaction can be minutes old, and
+        // doesn't account for earlier lines of this same order).
+        const liveProduct = await tx.product.findUnique({
+          where: { id: productId },
+          select: { stockQuantity: true },
+        });
+        const liveShared = liveProduct?.stockQuantity ?? 0;
+
         if (item.variationId && item.stockMode === "DEDICATED") {
-          const variation = variationMap.get(item.variationId);
-          const prevQty = variation?.stockQuantity ?? 0;
+          const liveVariation = await tx.productVariation.findUnique({
+            where: { id: item.variationId },
+            select: { stockQuantity: true },
+          });
+          const prevQty = liveVariation?.stockQuantity ?? 0;
 
           const result = await tx.productVariation.updateMany({
             where: {
@@ -169,15 +183,15 @@ export async function deductStockForOrder(
               salesCount: { increment: item.quantity },
             },
           });
-          const shortfall = item.quantity - Math.max(0, product.stockQuantity);
+          const shortfall = item.quantity - Math.max(0, liveShared);
           await tx.inventoryLog.create({
             data: {
               productId,
               type: "OVERSOLD",
               quantity: -item.quantity,
-              previousQty: product.stockQuantity,
+              previousQty: liveShared,
               newQty: 0,
-              reason: `⚠ Oversold${item.variationLabel ? ` — ${item.variationLabel}` : ""} (order ${order.orderNumber}, paid but only ${Math.max(0, product.stockQuantity)} of ${item.quantity} available)`,
+              reason: `⚠ Oversold${item.variationLabel ? ` — ${item.variationLabel}` : ""} (order ${order.orderNumber}, paid but only ${Math.max(0, liveShared)} of ${item.quantity} available)`,
               reference: order.orderNumber,
               variationId: item.variationId ?? undefined,
               variationLabel: item.variationLabel ?? undefined,
@@ -204,8 +218,8 @@ export async function deductStockForOrder(
               // filter/group by sales channel unambiguously.
               type: "ONLINE_SALE",
               quantity: -item.quantity,
-              previousQty: product.stockQuantity,
-              newQty: product.stockQuantity - item.quantity,
+              previousQty: liveShared,
+              newQty: liveShared - item.quantity,
               reason: item.variationLabel
                 ? `Online order — ${item.variationLabel}`
                 : "Online order",
@@ -219,11 +233,6 @@ export async function deductStockForOrder(
           });
         }
       }
-
-      await tx.order.update({
-        where: { id: orderId },
-        data: { stockDeducted: true },
-      });
 
       return events;
     }),
@@ -254,26 +263,33 @@ export async function restoreStockForOrder(
   });
   const productMap = new Map(products.map((p) => [p.id, p]));
 
-  const variationIds = order.items
-    .filter((i) => i.variationId)
-    .map((i) => i.variationId as string);
-  const variations = variationIds.length
-    ? await prisma.productVariation.findMany({
-        where: { id: { in: variationIds } },
-      })
-    : [];
-  const variationMap = new Map(variations.map((v) => [v.id, v]));
-
   await runWithRetry(() =>
     prisma.$transaction(async (tx) => {
+      // Atomic claim (true→false) so a cancel and a refund webhook racing
+      // each other can't both restore the same stock.
+      const claim = await tx.order.updateMany({
+        where: { id: orderId, stockDeducted: true },
+        data: { stockDeducted: false },
+      });
+      if (claim.count === 0) return;
+
       for (const item of order.items) {
         const product = productMap.get(item.productId ?? "");
         const productId = item.productId;
         if (!product || !productId || !product.trackInventory) continue;
 
+        const liveProduct = await tx.product.findUnique({
+          where: { id: productId },
+          select: { stockQuantity: true },
+        });
+        const liveShared = liveProduct?.stockQuantity ?? 0;
+
         if (item.variationId && item.stockMode === "DEDICATED") {
-          const variation = variationMap.get(item.variationId);
-          const prevQty = variation?.stockQuantity ?? 0;
+          const liveVariation = await tx.productVariation.findUnique({
+            where: { id: item.variationId },
+            select: { stockQuantity: true },
+          });
+          const prevQty = liveVariation?.stockQuantity ?? 0;
           await tx.productVariation.update({
             where: { id: item.variationId },
             data: { stockQuantity: { increment: item.quantity } },
@@ -311,8 +327,8 @@ export async function restoreStockForOrder(
             // filter/group by sales channel unambiguously.
             type: "ONLINE_RETURN",
             quantity: item.quantity,
-            previousQty: product.stockQuantity,
-            newQty: product.stockQuantity + item.quantity,
+            previousQty: liveShared,
+            newQty: liveShared + item.quantity,
             reason: item.variationLabel
               ? `Online order — ${reason} (${item.variationLabel})`
               : `Online order — ${reason}`,
@@ -325,11 +341,31 @@ export async function restoreStockForOrder(
           },
         });
       }
-
-      await tx.order.update({
-        where: { id: orderId },
-        data: { stockDeducted: false },
-      });
     }),
   );
+}
+
+// Used by every payment-confirmation path. The deduction used to be fired
+// without waiting and a failure was only printed to the console — the order
+// stayed paid with stockDeducted=false forever and nothing retried it. This
+// waits for the result, retries transient failures, and never throws (a stock
+// problem must not turn a successful payment into an error response). It
+// returns false after the final attempt so callers can log it loudly; any
+// order left undeducted can be picked up by scripts/backfill-order-stock.ts.
+export async function deductStockWithRetry(
+  orderId: string,
+  performedBy?: { id?: string; name?: string },
+  attempts = 3,
+): Promise<boolean> {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await deductStockForOrder(orderId, performedBy);
+      return true;
+    } catch (err) {
+      console.error(`[stock] Deduction attempt ${i}/${attempts} failed for order ${orderId}:`, err);
+      if (i < attempts) await new Promise((r) => setTimeout(r, 500 * i));
+    }
+  }
+  console.error(`[stock] CRITICAL: order ${orderId} is paid but stock was NOT deducted — run scripts/backfill-order-stock.ts`);
+  return false;
 }
