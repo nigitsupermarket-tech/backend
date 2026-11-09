@@ -4,6 +4,7 @@ import { Response, NextFunction } from "express";
 import { AuthRequest } from "../middlewares/auth.middleware";
 import prisma from "../config/database";
 import { AppError } from "../utils/appError";
+import { normalizeBarcode } from "../utils/barcode";
 import PDFDocument from "pdfkit";
 import { parse } from "csv-parse/sync";
 import { stringify } from "csv-stringify/sync";
@@ -521,7 +522,9 @@ export const importProductsCSV = async (
       isOnPromotion: parseCsvBool(row.isOnPromotion),
       tags: row.tags ? row.tags.split("|").filter(Boolean) : [],
       images: row.images ? row.images.split("|").filter(Boolean) : [],
-      barcode: row.barcode || null,
+      // Excel hands us the cell as displayed ("8000810101937.00") — strip that
+      // artefact so the product stays scannable. See utils/barcode.ts.
+      barcode: normalizeBarcode(row.barcode),
       netWeight: row.netWeight || null,
       unitsPerCarton: row.unitsPerCarton ? parseInt(row.unitsPerCarton) : null,
       origin: row.origin || null,
@@ -570,7 +573,12 @@ export const importProductsCSV = async (
       if (!Array.isArray(parsed)) {
         throw new Error('"variations" must be a JSON array');
       }
-      return parsed as VariationInput[];
+      // Same ".00" cleanup for every variation barcode in the JSON cell.
+      return (parsed as VariationInput[]).map((v) =>
+        v && typeof v === "object" && v.barcode !== undefined && v.barcode !== null
+          ? { ...v, barcode: normalizeBarcode(v.barcode) }
+          : v,
+      );
     };
 
     // ── One query to fetch all existing products by SKU ────────────────────
@@ -747,7 +755,7 @@ export const importProductsCSV = async (
               safeData.isOnPromotion = parseCsvBool(row.isOnPromotion);
             if (row.tags) safeData.tags = row.tags.split("|").filter(Boolean);
             if (row.barcode !== undefined)
-              safeData.barcode = row.barcode || null;
+              safeData.barcode = normalizeBarcode(row.barcode);
             if (row.netWeight !== undefined)
               safeData.netWeight = row.netWeight || null;
             if (row.unitsPerCarton !== undefined)
@@ -1648,10 +1656,7 @@ export const importScaleGoodsSheet = async (
       const row = rows[i];
       const name = String(row[nameIdx] ?? "").trim();
       const codeRaw = row[codeIdx];
-      const code =
-        codeRaw === "" || codeRaw === undefined || codeRaw === null
-          ? null
-          : String(codeRaw).trim();
+      const code = normalizeBarcode(codeRaw);
       const priceRaw = row[priceIdx];
       let price: number | null = null;
       if (typeof priceRaw === "number") price = priceRaw;

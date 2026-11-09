@@ -22,7 +22,9 @@
     "backfill:scale-shipping-weight": "ts-node scripts/backfill-scale-shipping-weight.ts",
     "backfill:pending-delete-flag": "ts-node scripts/backfill-pending-delete-flag.ts",
     "backfill:freeze-pending-deletes": "ts-node scripts/backfill-freeze-existing-pending-deletes.ts",
-    "fix-cart-indexes": "ts-node scripts/fix-cart-indexes.ts"
+    "fix-cart-indexes": "ts-node scripts/fix-cart-indexes.ts",
+    "cleanup:dot-zero-barcodes": "ts-node scripts/strip-dot-zero-barcodes.ts",
+    "test:barcode": "ts-node tests/barcode.test.ts"
   },
   "keywords": [
     "ecommerce",

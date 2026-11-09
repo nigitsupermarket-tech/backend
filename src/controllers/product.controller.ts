@@ -8,6 +8,7 @@ import {
   deleteCloudinaryImage,
 } from "../lib/cloudinary";
 import { sendAdminProductDeleteRequestEmail } from "../services/email.service";
+import { normalizeBarcode, barcodeLookupVariants } from "../utils/barcode";
 
 // Roles that get to see/manage a frozen (pending-delete) product when they
 // explicitly ask for it via ?includeFrozen=true — everyone else (public
@@ -52,7 +53,7 @@ export function toVariationCreateInput(v: VariationInput) {
       v.compareAtPrice !== undefined && v.compareAtPrice !== null
         ? Number(v.compareAtPrice)
         : null,
-    barcode: v.barcode?.trim() || null,
+    barcode: normalizeBarcode(v.barcode),
     sku: v.sku?.trim() || null,
     stockQuantity:
       v.stockQuantity !== undefined && v.stockQuantity !== null
@@ -77,7 +78,7 @@ export async function assertVariationBarcodesAvailable(
   excludeProductId?: string,
 ) {
   const barcodes = incoming
-    .map((v) => v.barcode?.trim())
+    .map((v) => normalizeBarcode(v.barcode))
     .filter((b): b is string => !!b);
   if (barcodes.length === 0) return;
 
@@ -595,7 +596,8 @@ export const createProduct = async (
         description: description || "",
         shortDescription,
         sku,
-        barcode,
+        // Canonical form — a stray ".00"/whitespace here makes the product unscannable.
+        barcode: normalizeBarcode(barcode),
         price,
         comparePrice,
         costPrice,
@@ -766,6 +768,12 @@ export const updateProduct = async (
         ? Number(rest.stockQuantity)
         : undefined;
     delete rest.stockQuantity;
+
+    // Same canonicalisation as create — see utils/barcode.ts. Only touch the
+    // field when the client actually sent it.
+    if (rest.barcode !== undefined) {
+      rest.barcode = normalizeBarcode(rest.barcode);
+    }
     if (requestedAdminStock !== undefined && !(requestedAdminStock >= 0))
       throw new AppError("Stock quantity cannot be negative", 400);
 
@@ -1756,9 +1764,12 @@ export const getProducts = async (
     // "500g Pack" sticker) — POS relies on this to add the right preset
     // directly instead of falling back to the base product.
     if (barcode) {
+      // Match the canonical code AND the legacy "<code>.00" form, so a scan
+      // still resolves for rows the cleanup script hasn't fixed yet.
+      const codes = barcodeLookupVariants(barcode);
       const barcodeOr = [
-        { barcode: barcode as string },
-        { variations: { some: { barcode: barcode as string } } },
+        { barcode: { in: codes } },
+        { variations: { some: { barcode: { in: codes } } } },
       ];
       // If a text `search` OR clause is already set, AND the two together
       // instead of clobbering it (barcode scans normally arrive alone, but
